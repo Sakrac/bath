@@ -1,0 +1,14 @@
+$Tools
+x65 = ../x65/x65 $In $Out $Args
+kapack_bundle = ../KaPack/KaPack $In $Out -bundle -prg
+kapack = ../KaPack/KaPack $In $Out $Args
+c64gfx = ../C64Gfx/C64Gfx $In $Out $Args
+reward = tools/RewardImages/RewardImages $In $Out
+minipak = tools/MiniPak/MiniPak $In $Args
+fontconv = tools/FontConv/FontConv $In $Out $Args
+bundle = tools/bundle/bundle
+
+$Execute
+
+
+$Finalize

@@ -1,54 +1,42 @@
+#ifdef _WIN32
 #include <windows.h>
-#include <algorithm>
-#include <cstdlib>
-#include <filesystem>
+#else
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#endif
+#include <stdlib.h>
+#include <vector>
 #define STRUSE_IMPLEMENTATION
 #include "struse/struse.h"
 
-namespace fs = std::filesystem;
+#if defined(_MSC_VER)
+#define FOpen(f, n, t) (fopen_s(&f, n, t) == 0)
+#else
+#define FOpen(f, n, t) (f = fopen(n, t))
+#define _MAX_PATH 2048
+#endif
 
-bool executeScript(const strref path, const strref currFolder, const strref args);
+// TODO:
+//  Commands can have multiple out files (c64addr -split)
+//  Commands can have multiple in files (minipak)
 
-bool HandleMkDir(strref args, strref currFolder) {
-    while(args) {
-		args.skip_whitespace();
-        // skip -p
-        if (args.get_first() == '-') {
-            ++args; args.skip_whitespace();
-            args.skip(args.len_word());
-        } else {
-            strref path = args.get_path();
-            if (!path.valid()) {
-                printf("mkdir: missing operand\n");
-                return false;
-            }
-            args.skip(path.get_len());
-            args.skip_whitespace();
+typedef enum BathStatus : uint8_t {
+    BathStatus_Unset = 0,
+    BathStatus_Tools,
+    BathStatus_Execute,
+    BathStatus_Finalize
+} BathStatus;
 
-			strown<_MAX_PATH> fullPath(currFolder);
-            if(currFolder.valid() && currFolder.get_last() != '/' && currFolder.get_last() != '\\') {
-                fullPath.append('\\');
-			}
-            fullPath.append(path);
-            fullPath.cleanup_path();
+bool runExternalCommand(strref commandline) {
+	strown<_MAX_PATH> fullCommand(commandline);
+#ifdef _WIN32
+    fullCommand.replace('/', '\\');
+#else
+    fullCommand.replace('\\', '/');
+#endif
 
-            fs::path target(std::string(fullPath.get(), fullPath.get_len()));
-            std::error_code ec;
-            fs::create_directories(target, ec);
-            if (ec) {
-                printf( "Failed to create directory: " STRREF_FMT "\n", STRREF_ARG(path));
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-bool runExternalCommand(strref command, strref args) {
-	strown<_MAX_PATH> fullCommand(command);
-	fullCommand.append(' ').append(args);
-
-    const int exitCode = std::system(fullCommand.c_str());
+    const int exitCode = system(fullCommand.c_str());
     if (exitCode != 0) {
         printf( "Command failed with exit code %d (" STRREF_FMT ")\n", exitCode, STRREF_ARG( fullCommand ));
         return false;
@@ -56,36 +44,9 @@ bool runExternalCommand(strref command, strref args) {
     return true;
 }
 
-bool executeLine(const strref rawLine, const strref scriptDirectory, const strref args) {
-    strown<1024> fixedLine(rawLine.get_trimmed_ws());
-    fixedLine.replace('\\', '/');
-
-    if (fixedLine.empty() || fixedLine.get_first() == '#') {
-        return true;
-    }
-
-    strref line = fixedLine;
-    strref command = line.get_path();
-    line.skip(command.get_len());
-    line.skip_whitespace();
-
-    strref ext = command.after_last('.');
-    if (ext.same_str("sh")) {
-        printf("Executing script: " STRREF_FMT " " STRREF_FMT "\n", STRREF_ARG( command ), STRREF_ARG( line ) );
-        return executeScript(command, scriptDirectory, strref());
-    } else if (command.same_str("mkdir")) {
-        return HandleMkDir(line, scriptDirectory);
-    } else if (command.same_str("set") || command.same_str("rm")) {
-        // do nothing for set
-        return true;
-    }
-    printf("Executing command: " STRREF_FMT " " STRREF_FMT "\n", STRREF_ARG(command), STRREF_ARG(line));
-    return runExternalCommand(command, line);
-}
-
 uint8_t *LoadFile(const char* path, size_t *outSize) {
     FILE *file = nullptr;
-    if (fopen_s(&file, path, "rb") == 0 && file) {
+    if (FOpen(file, path, "rb") && file) {
         fseek(file, 0, SEEK_END);
         size_t size = ftell(file);
         fseek(file, 0, SEEK_SET);
@@ -100,82 +61,209 @@ uint8_t *LoadFile(const char* path, size_t *outSize) {
     return nullptr;
 }
 
-bool TryResolveScriptPath(const strref path, const strref currFolder, strown<_MAX_PATH>& outPath, uint8_t** scriptBuffer, size_t* scriptSize) {
-    auto tryCandidate = [&](const strref base) -> bool {
-        if (!base.valid()) {
-            return false;
-        }
 
-        strown<_MAX_PATH> candidate;
-        candidate.copy(base);
-        if (candidate.get_last() != '/' && candidate.get_last() != '\\') {
-            candidate.append('/');
-        }
-        candidate.append(path);
-        candidate.cleanup_path();
+// register a tool for the bath script
+typedef struct BathTool {
+    strref name;        // "x65"
+    strref command;     // "../x65/x65"
+    strref mapping;     // "fixed_args $Args -source=$In -out=$Out"
+} BathTool;
 
-        uint8_t *loaded = LoadFile(candidate.c_str(), scriptSize);
-        if (!loaded) {
-            return false;
-        }
+std::vector<BathTool> RegisteredTools;
 
-        outPath.copy(candidate);
-        if (scriptBuffer) {
-            *scriptBuffer = loaded;
-        }
-        return true;
-    };
+int registerTool(strref line) {
 
-    if (path.get_first() == '/' || path.get_first() == '\\' || (path.get_len() >= 2 && path[1] == ':')) {
-        strown<_MAX_PATH> absolute;
-        absolute.copy(path);
-        absolute.cleanup_path();
-        uint8_t *loaded = LoadFile(absolute.c_str(), scriptSize);
-        if (!loaded) {
-            return false;
-        }
-        outPath.copy(absolute);
-        if (scriptBuffer) {
-            *scriptBuffer = loaded;
-        }
-        return true;
+    // get name of tool
+    strref name = line.split_lang();
+    line += name.get_len();
+
+    if(name.get_first()=='"' && name.get_last() == '"') { name.skip(1); name.clip(1); name.trim_whitespace(); }
+
+    if (!name.valid()) {
+        printf("Error: Tool name is missing in line: " STRREF_FMT "\n", STRREF_ARG(line));
+        return 1;
     }
 
-    if (tryCandidate(currFolder)) {
-        return true;
+    if (line.get_first()=='=') {
+        ++line; line.skip_whitespace();
     }
 
-    char cwd[4096];
-    if (GetCurrentDirectoryA(sizeof(cwd), cwd)) {
-        strref cwdRef(cwd);
-        if (tryCandidate(cwdRef)) {
-            return true;
-        }
+    strref command = line.split_lang();
+    line += command.get_len();
+    if(command.get_first()=='"' && command.get_last() == '"') { command.skip(1); command.clip(1); command.trim_whitespace(); }
+
+    if (!command.valid()) {
+        printf("Error: Tool command is missing in line: " STRREF_FMT "\n", STRREF_ARG(line));
+        return 1;
     }
 
-    return false;
+    strref mapping = line.get_trimmed_ws();
+    if(mapping.get_first()=='"' && mapping.get_last() == '"') { mapping.skip(1); mapping.clip(1); mapping.trim_whitespace(); }
+
+    if (!mapping.valid()) {
+        printf("Error: Tool mapping is missing in line: " STRREF_FMT "\n", STRREF_ARG(line));
+        return 1;
+    }
+
+    BathTool tool = { name, command, mapping };
+    RegisteredTools.push_back(tool);
+    return 1;
 }
 
-bool executeScript(const strref path, const strref currFolder, const strref args) {
-    strown<_MAX_PATH> fullPath;
-    size_t scriptSize = 0;
-    uint8_t *script = nullptr;
-    if (!TryResolveScriptPath(path, currFolder, fullPath, &script, &scriptSize)) {
-        printf("Failed to load script: " STRREF_FMT "\n", STRREF_ARG(path));
-        return false;
+int executeLine(strref line, strref scriptFolder) {
+    strref name = line.split_lang();
+    line += name.get_len();
+
+    if(name.get_first()=='"' && name.get_last() == '"') { name.skip(1); name.clip(1); name.trim_whitespace(); }
+
+    line = line.before_or_full('#').get_trimmed_ws(); // remove comments
+
+    // params are in, out, args
+    strref params = line.get_trimmed_ws();
+    if(params.get_first() == '(' && params.get_last() == ')') { params.skip(1); params.clip(1); params.trim_whitespace(); }
+
+    strref in = params.token_chunk(',').get_trimmed_ws();
+    strref out = params.token_chunk(',').get_trimmed_ws();
+    strref args = params.token_chunk(',').get_trimmed_ws();
+
+    struct stat stat_in = {}, stat_out = {};
+
+    int stat_in_result = stat(strown<_MAX_PATH>(in).c_str(), &stat_in);
+    int stat_out_result = stat(strown<_MAX_PATH>(out).c_str(), &stat_out); 
+
+    bool in_exists = (stat_in_result == 0);
+    bool out_exists = (stat_out_result == 0);
+
+    if (!in_exists) {
+        printf("Input file does not exist: " STRREF_FMT "\n", STRREF_ARG(in));
+        return 1;
     }
 
-    strref scriptFolder = fullPath.get_strref().before_last('/', '\\');
+    bool in_newer = false;
+    if (in_exists && out_exists) {
+        in_newer = stat_in.st_mtim.tv_sec > stat_out.st_mtim.tv_sec;
+    } else if (in_exists && !out_exists) {
+        in_newer = true;
+    } else if (!in_exists && out_exists) {
+        in_newer = false;
+    } else {
+        in_newer = true;
+    }
 
-    strref file((const char*)script, (strl_t)scriptSize), fileOrig = file;
-    while(strref line = file.line()) {
-        if (!executeLine(line, scriptFolder, strref())) {
-            printf("Stopping at line %d of " STRREF_FMT "\n", 
-                fileOrig.count_lines(line), STRREF_ARG(fullPath));
-            return false;
+    if (!in_newer) {
+        printf("Skipping command because output is newer than input: " STRREF_FMT "\n", STRREF_ARG(line));
+        return 0;
+    }
+
+    for(const BathTool& tool : RegisteredTools) {
+        if (name.same_str(tool.name)) {
+            strown<_MAX_PATH> fullCommand(tool.command);
+            fullCommand.append(" ");
+            fullCommand.append(tool.mapping);
+            fullCommand.replace("$Args", args);
+            fullCommand.replace("$In", in);
+            fullCommand.replace("$Out", out);
+            return runExternalCommand(fullCommand);
         }
     }
-    return true;
+    printf("Error: Tool not registered: " STRREF_FMT "\n", STRREF_ARG(name));
+    return 1;
+}
+
+
+int runBath(const char* scriptFile, const char **args, int argn);
+
+std::vector<char*> PreviousIncludes;
+
+int includeScript(strref line, strref scriptFolder, const char** args, int argn) {
+    strref includePath = line.get_trimmed_ws();
+    strown<_MAX_PATH> fullIncludePath;
+
+    if (includePath.has_prefix("/") || includePath.has_prefix("\\") || includePath[1] == ':') {
+        fullIncludePath.copy(includePath);
+    } else {
+        fullIncludePath.copy(scriptFolder);
+        fullIncludePath.append("/");
+        fullIncludePath.append(includePath);
+    }
+
+    fullIncludePath.cleanup_path();
+    for( char* prevInclude : PreviousIncludes ) {
+        if (fullIncludePath.same_str_case(prevInclude)) {
+            printf("Include skipped because it is already loaded: " STRREF_FMT "\n", STRREF_ARG(fullIncludePath));
+            return 0;
+        }
+    }
+    PreviousIncludes.push_back(strdup(fullIncludePath.c_str()));
+
+    return runBath(fullIncludePath.c_str(), args, argn);
+}
+
+int runBath(const char* scriptFile, const char **args, int argn) {
+    size_t scriptSize = 0;
+    uint8_t *script = LoadFile(scriptFile, &scriptSize);
+
+    if (!script) {
+        printf("Failed to load bath script: %s\n", scriptFile);
+        return 1;
+    }
+
+    BathStatus Status = BathStatus_Unset;
+
+    // path from current working folder
+    strref path(strref(scriptFile).before_last_or_full('/', '\\'));
+
+    strref scriptRef((const char*)script, (strl_t)scriptSize), file(scriptRef);
+    while(strref line = file.line()) {
+        line.trim_whitespace();
+        if (!line.valid() || line.get_first() == '#' || line.has_prefix("---")) {
+            continue;
+        }
+        if( line.grab_prefix("$")) {
+            strref command = line.get_word();
+            line += command.get_len();
+            if (command.same_str("tools")) {
+                Status = BathStatus_Tools;
+                continue;
+            } else if (command.same_str("execute")) {
+                Status = BathStatus_Execute;
+                continue;
+            } else if (command.same_str("finalize")) {
+                Status = BathStatus_Finalize;
+                continue;
+            } else if (command.same_str("include")) {
+                includeScript(line, path, args, argn);
+                continue;
+            }
+            continue;
+        }
+        switch (Status) {
+            case BathStatus_Unset:
+                printf("Error: No status set before executing line: " STRREF_FMT "\n", STRREF_ARG(line));
+                return 1;
+            case BathStatus_Tools:
+                if (!registerTool(line)) {
+                    printf("Stopping at line %d of %s\n", scriptRef.count_lines(line), scriptFile);
+                    return 1;
+                }
+                break;
+            case BathStatus_Execute: {
+                int errorCode = executeLine(line, path);
+                if (errorCode != 0) {
+                    printf("Failed execution at line %d of %s with error code %d\n", scriptRef.count_lines(line), scriptFile, errorCode);
+                    return 1;
+                }
+                break;
+            }
+            case BathStatus_Finalize:
+                if (!runExternalCommand(line)) {
+                    printf("Stopping at line %d of %s\n", scriptRef.count_lines(line), scriptFile);
+                    return 1;
+                }
+                break;
+        }
+    }
+    return 0;
 }
 
 int main(int argc, char** argv) {
@@ -183,10 +271,19 @@ int main(int argc, char** argv) {
         printf( "Usage: bath <script.sh>\n");
         return 1;
     }
-
+#ifdef _WIN32
     char currDir[512];
     GetCurrentDirectoryA(sizeof(currDir), currDir);
     printf("%s\n", currDir);
+#else
+			char* currDir = getcwd(NULL, 0);
+			if( currDir) {
+				printf("%s\n", currDir);
+//				free(dir);
+			}
 
-    return executeScript(argv[1], strref(currDir), argc > 2 ? strref(argv[2]) : strref()) ? 0 : 2;
+    #endif
+
+    int errorCode = runBath(argv[1], (const char **)(argv+2), argc-2);
+    return errorCode;
 }
