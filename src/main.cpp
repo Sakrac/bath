@@ -1,12 +1,14 @@
 #ifdef _WIN32
 #include <windows.h>
-#else
+#include <direct.h>
+#endif
 #include <sys/stat.h>
+#include <stdlib.h>
+#include <string.h>
+#ifndef _WIN32
 #include <time.h>
 #include <unistd.h>
 #endif
-#include <stdlib.h>
-#include <vector>
 #define STRUSE_IMPLEMENTATION
 #include "struse/struse.h"
 
@@ -27,6 +29,20 @@ typedef enum BathStatus : uint8_t {
     BathStatus_Execute,
     BathStatus_Finalize
 } BathStatus;
+
+#define MAX_REGISTERED_TOOLS 128
+#define MAX_PREVIOUS_INCLUDES 256
+
+static bool ShowCommands = true;
+
+static char* dupCString(const char* text) {
+    size_t len = strlen(text) + 1;
+    char* copy = (char*)malloc(len);
+    if (copy) {
+        memcpy(copy, text, len);
+    }
+    return copy;
+}
 
 bool runExternalCommand(strref commandline) {
 	strown<_MAX_PATH> fullCommand(commandline);
@@ -51,10 +67,12 @@ uint8_t *LoadFile(const char* path, size_t *outSize) {
         size_t size = ftell(file);
         fseek(file, 0, SEEK_SET);
         uint8_t *buffer = (uint8_t*)malloc(size);
-        fread(buffer, 1, size, file);
-        fclose(file);
-        if (outSize) {
-            *outSize = size;
+        if (buffer) {
+            fread(buffer, 1, size, file);
+            fclose(file);
+            if (outSize) {
+                *outSize = size;
+            }
         }
         return buffer;
     }
@@ -64,12 +82,14 @@ uint8_t *LoadFile(const char* path, size_t *outSize) {
 
 // register a tool for the bath script
 typedef struct BathTool {
-    strref name;        // "x65"
-    strref command;     // "../x65/x65"
-    strref mapping;     // "fixed_args $Args -source=$In -out=$Out"
+    strref name;        // Required "x65"
+    strref command;     // Required "../x65/x65"
+    strref mapping;     // Optional "fixed_args $Args -source=$In -out=$Out"
+    strref auto_out;    // Optional $Out = obj/$In.filename.x65
 } BathTool;
 
-std::vector<BathTool> RegisteredTools;
+BathTool RegisteredTools[MAX_REGISTERED_TOOLS];
+int RegisteredToolCount = 0;
 
 int registerTool(strref line) {
 
@@ -105,14 +125,44 @@ int registerTool(strref line) {
         return 1;
     }
 
+    if (RegisteredToolCount >= MAX_REGISTERED_TOOLS) {
+        printf("Error: Too many tools registered\n");
+        return 0;
+    }
+
     BathTool tool = { name, command, mapping };
-    RegisteredTools.push_back(tool);
+    RegisteredTools[RegisteredToolCount++] = tool;
     return 1;
+}
+
+
+static const strref match_filename = "filename";
+
+strshr replaceFileMatch(strshr shared, strref match, strref replace) {
+    int pos = 0;
+    do {
+        pos = shared.find(match, pos);
+        strref rep = replace;
+		strl_t match_len = match.get_len();
+        if (pos >= 0) {
+            if (shared[pos + match_len] == '.') {
+                if ((shared + pos + match_len + 1).has_prefix(match_filename)) {
+                    match_len += match_filename.get_len() + 1;
+                    rep = rep.after_last_or_full('/', '\\').before_last_or_full('.', '.');
+                }
+            }
+
+            shared.erase(pos, match_len);
+            shared.insert(rep, pos);
+            pos += rep.get_len();
+		}
+    } while (pos >= 0);
+    return shared;
 }
 
 int executeLine(strref line, strref scriptFolder) {
     strref name = line.split_lang();
-    line += name.get_len();
+    line.skip_whitespace();
 
     if(name.get_first()=='"' && name.get_last() == '"') { name.skip(1); name.clip(1); name.trim_whitespace(); }
 
@@ -122,9 +172,13 @@ int executeLine(strref line, strref scriptFolder) {
     strref params = line.get_trimmed_ws();
     if(params.get_first() == '(' && params.get_last() == ')') { params.skip(1); params.clip(1); params.trim_whitespace(); }
 
-    strref in = params.token_chunk(',').get_trimmed_ws();
-    strref out = params.token_chunk(',').get_trimmed_ws();
-    strref args = params.token_chunk(',').get_trimmed_ws();
+	// command out : in args
+    strref out = params.next_token(':').get_trimmed_ws(); ++params; params.skip_whitespace();
+    strref in = params.next_token(' ').get_trimmed_ws();
+    strref args = params.get_trimmed_ws();
+
+	if (in.get_first() == '"' && in.get_last() == '"') { in.skip(1); in.clip(1); in.trim_whitespace(); }
+	if (out.get_first() == '"' && out.get_last() == '"') { out.skip(1); out.clip(1); out.trim_whitespace(); }
 
     struct stat stat_in = {}, stat_out = {};
 
@@ -141,7 +195,11 @@ int executeLine(strref line, strref scriptFolder) {
 
     bool in_newer = false;
     if (in_exists && out_exists) {
+#if defined(_WIN32)
+        in_newer = stat_in.st_mtime > stat_out.st_mtime;
+#else
         in_newer = stat_in.st_mtim.tv_sec > stat_out.st_mtim.tv_sec;
+#endif
     } else if (in_exists && !out_exists) {
         in_newer = true;
     } else if (!in_exists && out_exists) {
@@ -150,19 +208,30 @@ int executeLine(strref line, strref scriptFolder) {
         in_newer = true;
     }
 
-    if (!in_newer) {
+    if (!ShowCommands && !in_newer) {
         printf("Skipping command because output is newer than input: " STRREF_FMT "\n", STRREF_ARG(line));
         return 0;
-    }
-
-    for(const BathTool& tool : RegisteredTools) {
+	}
+ 
+    for (int i = 0; i < RegisteredToolCount; ++i) {
+        const BathTool& tool = RegisteredTools[i];
         if (name.same_str(tool.name)) {
             strown<_MAX_PATH> fullCommand(tool.command);
             fullCommand.append(" ");
             fullCommand.append(tool.mapping);
             fullCommand.replace("$Args", args);
-            fullCommand.replace("$In", in);
-            fullCommand.replace("$Out", out);
+            fullCommand.set_len(replaceFileMatch(fullCommand, "$In", in).get_len());
+			fullCommand.set_len(replaceFileMatch(fullCommand, "$Out", out).get_len());
+
+            if(ShowCommands) {
+                printf( STRREF_FMT "\n", STRREF_ARG(fullCommand));
+			}
+
+            if (!in_newer) {
+				printf("Skipping command because output is newer than input: " STRREF_FMT "\n", STRREF_ARG(line));
+				return 0;
+			}
+
             return runExternalCommand(fullCommand);
         }
     }
@@ -173,7 +242,8 @@ int executeLine(strref line, strref scriptFolder) {
 
 int runBath(const char* scriptFile, const char **args, int argn);
 
-std::vector<char*> PreviousIncludes;
+char* PreviousIncludes[MAX_PREVIOUS_INCLUDES];
+int PreviousIncludeCount = 0;
 
 int includeScript(strref line, strref scriptFolder, const char** args, int argn) {
     strref includePath = line.get_trimmed_ws();
@@ -188,13 +258,17 @@ int includeScript(strref line, strref scriptFolder, const char** args, int argn)
     }
 
     fullIncludePath.cleanup_path();
-    for( char* prevInclude : PreviousIncludes ) {
-        if (fullIncludePath.same_str_case(prevInclude)) {
+    for (int i = 0; i < PreviousIncludeCount; ++i) {
+        if (fullIncludePath.same_str_case(PreviousIncludes[i])) {
             printf("Include skipped because it is already loaded: " STRREF_FMT "\n", STRREF_ARG(fullIncludePath));
             return 0;
         }
     }
-    PreviousIncludes.push_back(strdup(fullIncludePath.c_str()));
+    if (PreviousIncludeCount >= MAX_PREVIOUS_INCLUDES) {
+        printf("Error: Too many included scripts\n");
+        return 1;
+    }
+    PreviousIncludes[PreviousIncludeCount++] = dupCString(fullIncludePath.c_str());
 
     return runBath(fullIncludePath.c_str(), args, argn);
 }
@@ -276,13 +350,12 @@ int main(int argc, char** argv) {
     GetCurrentDirectoryA(sizeof(currDir), currDir);
     printf("%s\n", currDir);
 #else
-			char* currDir = getcwd(NULL, 0);
-			if( currDir) {
-				printf("%s\n", currDir);
+	char* currDir = getcwd(NULL, 0);
+	if( currDir) {
+		printf("%s\n", currDir);
 //				free(dir);
-			}
-
-    #endif
+	}
+#endif
 
     int errorCode = runBath(argv[1], (const char **)(argv+2), argc-2);
     return errorCode;

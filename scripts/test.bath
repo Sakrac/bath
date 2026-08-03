@@ -1,5 +1,4 @@
 $Tools
-x65 = ../x65/x65 $In $Out $Args
 kapack_bundle = ../KaPack/KaPack $In $Out -bundle -prg
 kapack = ../KaPack/KaPack $In $Out $Args
 c64gfx = ../C64Gfx/C64Gfx $In $Out $Args
@@ -7,8 +6,22 @@ reward = tools/RewardImages/RewardImages $In $Out
 minipak = tools/MiniPak/MiniPak $In $Args
 fontconv = tools/FontConv/FontConv $In $Out $Args
 bundle = tools/bundle/bundle
+x65 = ../x65/x65 $In -lst=lst/$In.filename.lst -obj $Out -srcdbg
 
 $Execute
 
+x65 "obj/DebugView.x65" : src/debugview.s
+x65 obj/DebugJump.x65 : "src/debugjump.s"
+x65 obj/CPU.x65 : src/cpu.s
+x65 obj/transition.x65 : src/transition.s
+x65 obj/Math.x65 : src/math.s
+x65 obj/MemCpy.x65 : src/memcpy.s
+x65 obj/Game.x65 : src/game.s
+x65 obj/Input.x65 : src/input.s
+x65 obj/Return.x65 : src/return.s
+x65 obj/loadtext.x65 : src/loadtext.s
+x65 obj/SprText.x65 : src/sprtext.s
+x65 obj/Dialog.x65 : src/dialog.s
+x65 obj/Script.x65 : src/script.s
 
 $Finalize
