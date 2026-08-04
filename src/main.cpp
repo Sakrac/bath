@@ -672,12 +672,13 @@ int main(int argc, char** argv) {
 	for (int i = 1; i < argc; ++i) {
 		strref arg(argv[i]);
 		if (arg.grab_prefix("-")) {
-			if (arg.same_str("nocommands")) { RunCommands = false; }
+			if (arg.same_str("nocommands")) { RunCommands = false; ShowCommands = true; }
 			else if (arg.same_str("commands")) { RunCommands = true; }
 			else if (arg.same_str("simulate")) { RunCommands = false; }
 			else if (arg.same_str("force-single-thread")) { ForceSingleThread = true; }
 			else if (arg.same_str("single")) { ForceSingleThread = true; }
 			else if (arg.same_str("clean")) { Clean = true; }
+			else if (arg.same_str("clear")) { Clean = true; }
 			else if (arg.same_str("rebuild")) { Rebuild = true; }
 			else if (arg.same_str("verbose")) { Verbose = true; }
 			else if (arg.same_str("echo_off")) { ShowCommands = false; }

@@ -2,11 +2,13 @@
 
 Bath is a small build tool for running command pipelines from a single script. It is meant to replace handwritten .bat or .sh files for asset conversion, assembly, and other build steps.
 
-A Bath script is read top to bottom. The tools are declared first, then execution commands are run, and an optional finalize section can run raw commands at the end.
+A bath script is read top to bottom. The tools are declared first, then execution commands are run, and an optional finalize section can run raw commands at the end.
+
+Bath is essentially `make` but for running various tools in a specific order rather than compiling all touched files for a project.
 
 ## Script structure
 
-A Bath file usually has three parts:
+A bath file usually has three parts:
 
 1. A tool declaration block started with `$tools`
 2. An execution block started with `$execution`
@@ -19,8 +21,8 @@ The current implementation recognizes these directives:
 - `$Include` followed by a path to another Bath file. Includes are tracked so the same file is only loaded once.
 - `$Tools` starts the tool declaration block.
 - `$Execution` starts the execution block.
-- `$Parallell` enables parallel execution for later commands.
-- `$Sequential` switches back to sequential execution.
+- `$Parallel` or `$Parallell` enables parallel execution for later commands.
+- `$Sequential` switches back to sequential execution after waiting for all parallel commands to finish.
 - `$Sync` waits for all currently running parallel commands to finish before continuing.
 - `$Finalize` starts the finalize block. Any parallel work is finished first.
 
@@ -41,6 +43,8 @@ The command line for each execution can reference:
 - `$Args` for per-line arguments supplied in the execution block
 
 The replacement order is `$Args`, then `$In`, then `$Out`, so the per-line arguments can still refer to the file paths.
+
+## Path filters
 
 It is often useful to reference only a filename or path component. Bath provides a small set of filters for this:
 
@@ -70,6 +74,8 @@ x65 obj/Game.x65 : src/game.s
 
 In this example, `.x65` is the generated object file and `.s` is the source that produces it.
 
+Note that for format is: **tool output : input arguments**
+
 ## Multiple inputs and outputs
 
 Wrap multiple paths in parentheses to pass several files at once:
@@ -97,11 +103,10 @@ The current implementation accepts these flags:
 - `-commands` - print commands and execute them
 - `-nocommands` - print commands without executing them
 - `single` or `-force-single-thread` - disable parallel execution even if `$parallell` is active
-- `-rebuild` - force commands to run even when the outputs look newer
+- `-clean` or `-clear` - delete output files and don't execute
+- `-rebuild` - force commands to run even when the outputs are newer than the inputs. Can be combined with `-clear` to first delete then rebuild.
 - `-verbose` - print extra diagnostic information
 - `-echo_off` - skip printing the command lines before execution
-
-A `-clean` flag is recognized in the parser, but the output-cleanup behavior is still a work in progress.
 
 ## Background
 
@@ -112,10 +117,14 @@ Due to "outdated" hardware I switched one computer to Linux. As a hobby retro ha
 
 It usually completes in seconds or at least significantly faster than a minute. And switching to Linux means I created corresponding .sh files to the .bat files and manually make sure they sync up after working on one computer or another. This is surprisingly error prone and tedious, so I figured I could make a tool to process .bat/.sh so I'd only need to keep one.
 
-I named it by verbifying ".bat/.sh" and started implementing .bat/.sh-it. As always happens this turned into a loop of realizing a ton of dos commands are just in dos so after implementing one after another this process just didn't hold up. Each time I'd run batshit I'd go more crazy. So I stopped to think.
+I named it by verbifying ".bat/.sh" and started implementing .bat/.sh-it. As always happens this turned into a loop of realizations.
+
+A ton of `ms-dos` commands are just in `ms-dos` so after implementing one after another this process just didn't hold up. Each time I'd run batshit I'd go more crazy.
+
+So I stopped to think.
 
 One thing this really big project could use would be checking last modified date on the inputs and outputs before deciding to run each command, kind of like `make` does. And `make` has this big rule setup that I don't really want to think about again but I can make my own rule format!
 
 Basically I came up with something a hundred times simpler than `make` but that kept the one thing I wanted. And I also decided to make a simple-ish way to abbreviate the long command lines in the declaration.
 
-I named it `bath` because it sounds like batsh without being awkward to pronounce. So now I'm running baths instead of going batshit crazy.
+I named it `bath` because it sounds like batsh without being awkward to pronounce. So now I'm running baths instead of going batshit crazy!
