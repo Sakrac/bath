@@ -475,12 +475,8 @@ public:
 	// length of word consisting of alphanumeric characters
 	strl_t len_word() const { return len_alphanumeric(0); }
 
-	// length of a file path consisting of alphanumeric characters, underscores, hyphens and periods
-	strl_t len_path() const { if (valid()) {
-		const char *s = string; strl_t r = length;
-		while ((is_alphanumeric((uint8_t)*s) || *s=='/' || *s=='\\' || *s=='_' || *s=='-' || *s=='.') && r) { s++; r--; }
-		return length-r; } return 0; 
-	}
+	// length of a file path consisting of alphanumeric characters, underscores, hyphens and periods, can be quoted
+	strl_t len_path() const;
 
 	// length of string with escape characters
 	strl_t len_esc() const;
@@ -680,6 +676,23 @@ public:
 	strref split_label();
 	strref split_lang();
 	strref split_num();
+	strref split_path();
+
+	strref trim_surrounding_quotes() {
+		if (get_len() >= 2 && get_first() == '"' && get_last() == '"') {
+			string++;
+			length -= 2;
+		}
+		return *this;
+	}
+
+	strref trim_surrounding_parens() {
+		if (get_first() == '(' && get_last() == ')') {
+			string++;
+			length -= 2;
+		}
+		return *this;
+	}
 
 	// get a snippet, previous and full current line around a position
 	strref get_snippet( strl_t pos );
@@ -1180,37 +1193,8 @@ public:
 	strovl() { invalidate(); string_length = 0; }
 	strovl(char *ptr, strl_t space) { set_overlay(ptr, space); string_length = 0; }
     strovl(char *ptr, strl_t space, strl_t length) { set_overlay(ptr, space); string_length = length; }
-};
-
-class strshr_base {
-protected:
-	char *string_ptr;
-	strl_t string_length;
-	strl_t string_space;
-	void add_len_int(strl_t l) { string_length += l; } // unsafe add len (size already checked)
-	void sub_len_int(strl_t l) { string_length -= l; } // unsafe sub len (size already checked)
-	void set_len_int(strl_t l) { string_length = l; }
-	void dec_len_int() { string_length--; }
-	void inc_len_int() { string_length++; }
-public:
-	strl_t cap() const { return string_space; }
-	strl_t len() const { return string_length; }
-	char *charstr() { return string_ptr; }
-	const char* charstr() const { return string_ptr; }
-	void invalidate() { string_ptr = nullptr; string_space = 0; }
-	void set_overlay(char *ptr, strl_t space) { string_ptr = ptr; string_space = space; }
-	void set_overlay(char *ptr, strl_t space, strl_t len) {
-		string_ptr = ptr; string_space = space; string_length = len; }
-};
-
-// overlay string class, instance with 'strshr name(char *, size)'
-class strshr : public strmod<strshr_base> {
-public:
-	strshr() { invalidate(); string_length = 0; }
-	strshr(char *ptr, strl_t space) { set_overlay(ptr, space); string_length = 0; }
-	strshr(char *ptr, strl_t space, strl_t length) { set_overlay(ptr, space); string_length = length; }
-	template <int L>
-	strshr(strown<L>& orig) { string_ptr = orig.charstr(); string_length = orig.get_len(); string_space = L; }
+	template <strl_t L>
+	strovl(strown<L>& orig) { string_ptr = orig.charstr(); string_length = orig.get_len(); string_space = L; }
 };
 
 // helper for relative strings. purpose is for string collections that may need to grow
@@ -4475,7 +4459,37 @@ strref strref::split_num() {
 	return r;
 }
 
+strl_t strref::len_path() const {
+	if(!valid()) { return strref(); }
 
+	if(string[0]=='"') {
+		int f = find_after('"', 1);
+		if(f>=0) {
+			return f+1;
+		}
+		return 0;
+	}
+
+	strl_t left = length;
+	const char* scan = string;
+	while(left) {
+		char c = *scan;
+		if (c<=' ' || c=='#' || c=='&' || c=='{' || c=='}' || c=='<' || c=='>' || c=='?') {
+			break;
+		}
+		scan++;
+		left--;
+	}
+	return length - left;
+}
+
+strref strref::split_path() {
+	trim_whitespace();
+	strl_t split = len_path();
+	strref r(string, split);
+	skip(split);
+	return r;
+}
 // split string based on common programming tokens (words, quotes, scopes, numbers)
 strref strref::split_lang()
 {

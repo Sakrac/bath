@@ -34,6 +34,7 @@ typedef enum BathStatus : uint8_t {
 #define MAX_PREVIOUS_INCLUDES 256
 
 static bool ShowCommands = true;
+static bool RunCommands = false;
 
 static char* dupCString(const char* text) {
     size_t len = strlen(text) + 1;
@@ -108,22 +109,29 @@ int registerTool(strref line) {
         ++line; line.skip_whitespace();
     }
 
-    strref command = line.split_lang();
-    line += command.get_len();
-    if(command.get_first()=='"' && command.get_last() == '"') { command.skip(1); command.clip(1); command.trim_whitespace(); }
+    printf("line before command: " STRREF_FMT "\n", STRREF_ARG(line));
+
+    strref command = line.split_path();
+    command.trim_surrounding_quotes().trim_whitespace();
 
     if (!command.valid()) {
         printf("Error: Tool command is missing in line: " STRREF_FMT "\n", STRREF_ARG(line));
         return 1;
     }
 
+    printf("line after command: " STRREF_FMT "\n", STRREF_ARG(line));
+
     strref mapping = line.get_trimmed_ws();
-    if(mapping.get_first()=='"' && mapping.get_last() == '"') { mapping.skip(1); mapping.clip(1); mapping.trim_whitespace(); }
+    mapping.trim_surrounding_quotes().trim_whitespace();
 
     if (!mapping.valid()) {
         printf("Error: Tool mapping is missing in line: " STRREF_FMT "\n", STRREF_ARG(line));
         return 1;
     }
+
+    printf("mapping: " STRREF_FMT "\n", STRREF_ARG(mapping));
+
+    printf("line after mapping: " STRREF_FMT "\n", STRREF_ARG(line));
 
     if (RegisteredToolCount >= MAX_REGISTERED_TOOLS) {
         printf("Error: Too many tools registered\n");
@@ -138,7 +146,7 @@ int registerTool(strref line) {
 
 static const strref match_filename = "filename";
 
-strshr replaceFileMatch(strshr shared, strref match, strref replace) {
+strovl replaceFileMatch(strovl shared, strref match, strref replace) {
     int pos = 0;
     do {
         pos = shared.find(match, pos);
@@ -177,8 +185,8 @@ int executeLine(strref line, strref scriptFolder) {
     strref in = params.next_token(' ').get_trimmed_ws();
     strref args = params.get_trimmed_ws();
 
-	if (in.get_first() == '"' && in.get_last() == '"') { in.skip(1); in.clip(1); in.trim_whitespace(); }
-	if (out.get_first() == '"' && out.get_last() == '"') { out.skip(1); out.clip(1); out.trim_whitespace(); }
+    in.trim_surrounding_quotes().trim_whitespace();
+    out.trim_surrounding_quotes().trim_whitespace();
 
     struct stat stat_in = {}, stat_out = {};
 
@@ -216,21 +224,37 @@ int executeLine(strref line, strref scriptFolder) {
     for (int i = 0; i < RegisteredToolCount; ++i) {
         const BathTool& tool = RegisteredTools[i];
         if (name.same_str(tool.name)) {
+//            printf("tool.mapping: " STRREF_FMT "\n", STRREF_ARG(tool.mapping));
             strown<_MAX_PATH> fullCommand(tool.command);
+//            printf("tool.command: " STRREF_FMT "\n", STRREF_ARG(fullCommand));
             fullCommand.append(" ");
+//            printf("append(" "): " STRREF_FMT "\n", STRREF_ARG(fullCommand));
             fullCommand.append(tool.mapping);
+//            printf("append(tool.mapping): " STRREF_FMT "\n", STRREF_ARG(fullCommand));
             fullCommand.replace("$Args", args);
+//            printf("replace(\"$Args\"): " STRREF_FMT "\n", STRREF_ARG(fullCommand));
             fullCommand.set_len(replaceFileMatch(fullCommand, "$In", in).get_len());
+//            printf("$In " STRREF_FMT "\n", STRREF_ARG(fullCommand));
 			fullCommand.set_len(replaceFileMatch(fullCommand, "$Out", out).get_len());
 
+#ifdef _WIN32
+            fullCommand.replace('/', '\\');
+#else
+            fullCommand.replace('\\', '/');
+#endif
             if(ShowCommands) {
                 printf( STRREF_FMT "\n", STRREF_ARG(fullCommand));
 			}
+
+            if (!RunCommands) {
+                return 0;
+            }
 
             if (!in_newer) {
 				printf("Skipping command because output is newer than input: " STRREF_FMT "\n", STRREF_ARG(line));
 				return 0;
 			}
+            
 
             return runExternalCommand(fullCommand);
         }
