@@ -472,7 +472,13 @@ public:
 		const char *s = string+p; strl_t r = length-p; while (is_alphanumeric((uint8_t)*s) && r) { s++; r--; }
 		return length-r; } return 0; }
 
-	// length of word consisting of alphanumeric characters
+	// string content
+	// count number of alphanumeric characters from p
+	strl_t len_numeric(strl_t p = 0) const { if (valid()) {
+		const char *s = string+p; strl_t r = length-p; while (is_number((uint8_t)*s) && r) { s++; r--; }
+		return length-r; } return 0; }
+
+		// length of word consisting of alphanumeric characters
 	strl_t len_word() const { return len_alphanumeric(0); }
 
 	// length of a file path consisting of alphanumeric characters, underscores, hyphens and periods, can be quoted
@@ -557,6 +563,9 @@ public:
 
 	strref before_last(char c, char d) const {
 		int o = find_last(c, d); if (o>=0) return strref(string, o); return strref(); }
+
+	strref before_last_or_full(char c) const {
+		int o = find_last(c); if (o>=0) return strref(string, o); return *this; }
 
 	strref before_last_or_full(char c, char d) const {
 		int o = find_last(c, d); if (o>=0) return strref(string, o); return *this; }
@@ -4488,6 +4497,7 @@ strref strref::split_path() {
 	strl_t split = len_path();
 	strref r(string, split);
 	skip(split);
+	skip_whitespace();
 	return r;
 }
 // split string based on common programming tokens (words, quotes, scopes, numbers)

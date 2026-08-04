@@ -5,9 +5,13 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #ifndef _WIN32
 #include <time.h>
 #include <unistd.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/types.h>
 #endif
 #define STRUSE_IMPLEMENTATION
 #include "struse/struse.h"
@@ -35,6 +39,7 @@ typedef enum BathStatus : uint8_t {
 
 static bool ShowCommands = true;
 static bool RunCommands = false;
+static bool RunParallell = false;
 
 static char* dupCString(const char* text) {
     size_t len = strlen(text) + 1;
@@ -144,10 +149,29 @@ int registerTool(strref line) {
 }
 
 
+int NumberOfParallellCommands = 0;
+int MaxNumberOfParallellCommands = 8;
+
+bool RunParallellCommand(strovl commandline) {
+    return true;
+}
+
 static const strref match_filename = "filename";
+static const strref match_noext = "noext";
+static const strref match_path = "path";
 
 strovl replaceFileMatch(strovl shared, strref match, strref replace) {
     int pos = 0;
+
+    strref all_files = replace;
+
+    // in case of multple arguments pick only the first
+    if (replace.get_first()=='(') {
+        all_files.trim_surrounding_parens().trim_whitespace();
+        ++replace;
+        replace = replace.get_path();
+    }
+
     do {
         pos = shared.find(match, pos);
         strref rep = replace;
@@ -157,6 +181,27 @@ strovl replaceFileMatch(strovl shared, strref match, strref replace) {
                 if ((shared + pos + match_len + 1).has_prefix(match_filename)) {
                     match_len += match_filename.get_len() + 1;
                     rep = rep.after_last_or_full('/', '\\').before_last_or_full('.', '.');
+                }
+                else if ((shared + pos + match_len + 1).has_prefix(match_noext)) {
+                    match_len += match_noext.get_len() + 1;
+                    rep = rep.before_last_or_full('.');
+                }
+                else if ((shared + pos + match_len + 1).has_prefix(match_path)) {
+                    match_len += match_path.get_len() + 1;
+                    rep = rep.before_last_or_full('/', '\\');
+                }
+                else if (strref::is_number(shared[pos + match_len + 1])) {
+                    rep = all_files;
+                    int index = (shared + pos + match_len + 1).atoi();
+                    while (index > 1) {
+                        rep.split_path();
+                        rep.skip_whitespace();
+                        --index;
+                    }
+                    rep = rep.get_path();
+
+                    // if the next character is a dot, we can assume it's a file extension and skip it
+                    match_len += 1 + (shared + pos + match_len + 1).len_numeric();
                 }
             }
 
@@ -190,15 +235,46 @@ int executeLine(strref line, strref scriptFolder) {
 
     struct stat stat_in = {}, stat_out = {};
 
-    int stat_in_result = stat(strown<_MAX_PATH>(in).c_str(), &stat_in);
-    int stat_out_result = stat(strown<_MAX_PATH>(out).c_str(), &stat_out); 
+    __time_t newest_in_time = 0;
+    __time_t oldest_out_time = 0;
+    bool in_exists = false;
+    bool out_exists = false;
 
-    bool in_exists = (stat_in_result == 0);
-    bool out_exists = (stat_out_result == 0);
+    if(in.get_first() == '(' && in.get_last() == ')') {
+        strref all_in = in.trim_surrounding_parens().get_trimmed_ws();
+        while( strref in_multi = all_in.split_path() ) {
+            int stat_in_result = stat(strown<_MAX_PATH>(in_multi).c_str(), &stat_in);
+            if (stat_in_result == 0) {
+                in_exists = true;
+                if (stat_in.st_mtime > newest_in_time || newest_in_time == 0) {
+                    newest_in_time = stat_in.st_mtime;
+                }
+            }
+        }
+    } else {
+        int stat_in_result = stat(strown<_MAX_PATH>(in).c_str(), &stat_in);
+        in_exists = (stat_in_result == 0);
+    }
 
     if (!in_exists) {
         printf("Input file does not exist: " STRREF_FMT "\n", STRREF_ARG(in));
         return 1;
+    }
+
+    if(out.get_first() == '(' && out.get_last() == ')') {
+        strref all_out = out.trim_surrounding_parens().get_trimmed_ws();
+        while( strref out_multi = all_out.split_path() ) {
+            int stat_out_result = stat(strown<_MAX_PATH>(out_multi).c_str(), &stat_out);
+            if (stat_out_result == 0) {
+                out_exists = true;
+                if (stat_out.st_mtime < oldest_out_time || oldest_out_time == 0) {
+                    oldest_out_time = stat_out.st_mtime;
+                }
+            }
+        }
+    } else {
+        int stat_out_result = stat(strown<_MAX_PATH>(out).c_str(), &stat_out);
+        out_exists = (stat_out_result == 0);
     }
 
     bool in_newer = false;
@@ -224,17 +300,11 @@ int executeLine(strref line, strref scriptFolder) {
     for (int i = 0; i < RegisteredToolCount; ++i) {
         const BathTool& tool = RegisteredTools[i];
         if (name.same_str(tool.name)) {
-//            printf("tool.mapping: " STRREF_FMT "\n", STRREF_ARG(tool.mapping));
             strown<_MAX_PATH> fullCommand(tool.command);
-//            printf("tool.command: " STRREF_FMT "\n", STRREF_ARG(fullCommand));
             fullCommand.append(" ");
-//            printf("append(" "): " STRREF_FMT "\n", STRREF_ARG(fullCommand));
             fullCommand.append(tool.mapping);
-//            printf("append(tool.mapping): " STRREF_FMT "\n", STRREF_ARG(fullCommand));
             fullCommand.replace("$Args", args);
-//            printf("replace(\"$Args\"): " STRREF_FMT "\n", STRREF_ARG(fullCommand));
             fullCommand.set_len(replaceFileMatch(fullCommand, "$In", in).get_len());
-//            printf("$In " STRREF_FMT "\n", STRREF_ARG(fullCommand));
 			fullCommand.set_len(replaceFileMatch(fullCommand, "$Out", out).get_len());
 
 #ifdef _WIN32
@@ -323,8 +393,20 @@ int runBath(const char* scriptFile, const char **args, int argn) {
             if (command.same_str("tools")) {
                 Status = BathStatus_Tools;
                 continue;
-            } else if (command.same_str("execute")) {
+            } else if (command.same_str("execution")) {
                 Status = BathStatus_Execute;
+                continue;
+            } else if (command.same_str("parallell")) {
+                RunParallell = true;
+                Status = BathStatus_Execute;
+                continue;
+            } else if (command.same_str("sequential")) {
+                RunParallell = false;
+                Status = BathStatus_Execute;
+                // wait for all parallall commands to finish before continuing
+                continue;
+            } else if (command.same_str("sync")) {
+                // wait for all parallall commands to finish before continuing
                 continue;
             } else if (command.same_str("finalize")) {
                 Status = BathStatus_Finalize;
