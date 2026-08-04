@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <vector> // Note: Avoiding std includes but vector is useful.
 
 #ifndef _WIN32
 #include <time.h>
@@ -80,8 +81,9 @@ static bool Finalize = false;
 // string buffers for parallell command execution
 StringBuffer *pParallellCommandLines = nullptr;
 
-BathTool RegisteredTools[MAX_REGISTERED_TOOLS];
-int RegisteredToolCount = 0;
+std::vector<char*> IncludedScriptFiles;
+std::vector<BathTool> RegisteredTools;
+std::vector<char*> LoadedFiles;
 
 AtomicIntType NumberOfParallellCommands = 0;
 int MaxNumberOfParallellCommands = 8;
@@ -244,7 +246,9 @@ int registerTool(strref line) {
         ++line; line.skip_whitespace();
     }
 
-    printf("line before command: " STRREF_FMT "\n", STRREF_ARG(line));
+    if (Verbose) {
+        printf("line before command: " STRREF_FMT "\n", STRREF_ARG(line));
+    }
 
     strref command = line.split_path();
     command.trim_surrounding_quotes().trim_whitespace();
@@ -264,17 +268,8 @@ int registerTool(strref line) {
         return 1;
     }
 
-    printf("mapping: " STRREF_FMT "\n", STRREF_ARG(mapping));
-
-    printf("line after mapping: " STRREF_FMT "\n", STRREF_ARG(line));
-
-    if (RegisteredToolCount >= MAX_REGISTERED_TOOLS) {
-        printf("Error: Too many tools registered\n");
-        return 0;
-    }
-
     BathTool tool = { name, command, mapping };
-    RegisteredTools[RegisteredToolCount++] = tool;
+    RegisteredTools.push_back(tool);
     return 1;
 }
 
@@ -285,31 +280,45 @@ ThreadReturn ParallellCommandThread(ThreadArg Arg) {
     // Output the failure and set the error code if the command failed
     if (exitCode != 0) {
         printf( "Command failed with exit code %d (%s)\n", exitCode, (const char*)Arg);
+        LockMutex(&ParallellCommandMutex);
         ParallellCommandError = exitCode;
+        UnlockMutex(&ParallellCommandMutex);
     }
 
+    LockMutex(&ParallellCommandMutex);
     InterlockedDecrement(&NumberOfParallellCommands);
-    WaitConditionVariable(&ParallellCommandWait, &ParallellCommandMutex);
+    AwakeConditionVariable(&ParallellCommandWait);
+    UnlockMutex(&ParallellCommandMutex);
     return 0;
 }
 
 bool SyncParallellCommands() {
+    LockMutex(&ParallellCommandMutex);
     while (NumberOfParallellCommands > 0) {
-        LockMutex(&ParallellCommandMutex);
         WaitConditionVariable(&ParallellCommandWait, &ParallellCommandMutex);
-        UnlockMutex(&ParallellCommandMutex);
     }
+    UnlockMutex(&ParallellCommandMutex);
+
+    // Free the command line buffers that are not needed anymore
+    StringBuffer *buffer = pParallellCommandLines;
+    pParallellCommandLines = nullptr;
+    while(buffer) {
+        StringBuffer *next = buffer->next;
+        free(buffer);
+        buffer = next;
+    }
+
     return ParallellCommandError == 0;
 }
 
 bool RunParallellCommand(strovl commandline) {
+    LockMutex(&ParallellCommandMutex);
     while (NumberOfParallellCommands >= MaxNumberOfParallellCommands) {
-        LockMutex(&ParallellCommandMutex);
         WaitConditionVariable(&ParallellCommandWait, &ParallellCommandMutex);
-        UnlockMutex(&ParallellCommandMutex);
     }
 
     if (ParallellCommandError != 0) {
+        UnlockMutex(&ParallellCommandMutex);
         printf("Skipping command because a previous command failed with exit code %d\n", ParallellCommandError);
         return false;
     }
@@ -324,10 +333,13 @@ bool RunParallellCommand(strovl commandline) {
 
     char *commandlinePtr = pParallellCommandLines->buffer + pParallellCommandLines->length;
     memcpy(commandlinePtr, commandline.charstr(), commandline.get_len());
+    commandlinePtr[commandline.get_len()] = 0;
     pParallellCommandLines->length += commandline.get_len() + 1;
 
-    StartThread(nullptr, 0, ParallellCommandThread, (void*)&commandlinePtr, "ParallellCommand");
     InterlockedIncrement(&NumberOfParallellCommands);
+    UnlockMutex(&ParallellCommandMutex);
+
+    StartThread(nullptr, 0, ParallellCommandThread, (void*)&commandlinePtr, "ParallellCommand");
     return true;
 }
 
@@ -469,12 +481,13 @@ int executeLine(strref line, strref scriptFolder) {
     }
 
     if (!ShowCommands && !in_newer) {
-        printf("Skipping command because output is newer than input: " STRREF_FMT "\n", STRREF_ARG(line));
+        if (Verbose) {
+            printf("Skipping command because output is newer than input: " STRREF_FMT "\n", STRREF_ARG(line));
+        }
         return 0;
 	}
  
-    for (int i = 0; i < RegisteredToolCount; ++i) {
-        const BathTool& tool = RegisteredTools[i];
+    for( BathTool& tool : RegisteredTools ) {
         if (name.same_str(tool.name)) {
             strown<_MAX_PATH> fullCommand(tool.command);
             fullCommand.append(" ");
@@ -497,9 +510,11 @@ int executeLine(strref line, strref scriptFolder) {
             }
 
             if (!in_newer && !Rebuild) {
-				printf("Skipping command because output is newer than input: " STRREF_FMT "\n", STRREF_ARG(line));
-				return 0;
-			}
+                if (Verbose) {
+                    printf("Skipping command because output is newer than input: " STRREF_FMT "\n", STRREF_ARG(line));
+                }
+                return 0;
+            }
             
             if (RunParallell) {
                 return RunParallellCommand(fullCommand);
@@ -511,13 +526,13 @@ int executeLine(strref line, strref scriptFolder) {
     return 1;
 }
 
-int runBath(const char* scriptFile, const char **args, int argn);
+int runBath(const char* scriptFile);
 
-int includeScript(strref line, strref scriptFolder, const char** args, int argn) {
+int includeScript(strref line, strref scriptFolder) {
     strref includePath = line.get_trimmed_ws();
     strown<_MAX_PATH> fullIncludePath;
 
-    if (includePath.has_prefix("/") || includePath.has_prefix("\\") || includePath[1] == ':') {
+    if ((includePath.get_len()>1 && (includePath.has_prefix("/") || includePath.has_prefix("\\"))) || (includePath.get_len()>=2 &&includePath[1] == ':')) {
         fullIncludePath.copy(includePath);
     } else {
         fullIncludePath.copy(scriptFolder);
@@ -526,22 +541,20 @@ int includeScript(strref line, strref scriptFolder, const char** args, int argn)
     }
 
     fullIncludePath.cleanup_path();
-    for (int i = 0; i < PreviousIncludeCount; ++i) {
-        if (fullIncludePath.same_str_case(PreviousIncludes[i])) {
-            printf("Include skipped because it is already loaded: " STRREF_FMT "\n", STRREF_ARG(fullIncludePath));
+    for( char* PreviousInclude : IncludedScriptFiles) {
+        if (fullIncludePath.same_str_case(PreviousInclude)) {
+            if (Verbose) {
+                printf("Include skipped because it is already loaded: " STRREF_FMT "\n", STRREF_ARG(fullIncludePath));
+            }
             return 0;
         }
     }
-    if (PreviousIncludeCount >= MAX_PREVIOUS_INCLUDES) {
-        printf("Error: Too many included scripts\n");
-        return 1;
-    }
-    PreviousIncludes[PreviousIncludeCount++] = dupCString(fullIncludePath.c_str());
+    IncludedScriptFiles.push_back(_strdup(fullIncludePath.c_str()));
 
-    return runBath(fullIncludePath.c_str(), args, argn);
+    return runBath(fullIncludePath.c_str());
 }
 
-int runBath(const char* scriptFile, const char **args, int argn) {
+int runBath(const char* scriptFile) {
     size_t scriptSize = 0;
     uint8_t *script = LoadFile(scriptFile, &scriptSize);
 
@@ -549,6 +562,9 @@ int runBath(const char* scriptFile, const char **args, int argn) {
         printf("Failed to load bath script: %s\n", scriptFile);
         return 1;
     }
+
+    // remember the loaded script so it can be freed later
+    LoadedFiles.push_back((char*)script);
 
     BathStatus Status = BathStatus_Unset;
 
@@ -588,7 +604,7 @@ int runBath(const char* scriptFile, const char **args, int argn) {
                 Status = BathStatus_Finalize;
                 continue;
             } else if (command.same_str("include")) {
-                includeScript(line, path, args, argn);
+                includeScript(line, path);
                 continue;
             }
             continue;
@@ -630,15 +646,59 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     char currDir[512];
     GetCurrentDirectoryA(sizeof(currDir), currDir);
-    printf("%s\n", currDir);
+    if (Verbose) {
+        printf("Current directory: %s\n", currDir);
+    }
 #else
 	char* currDir = getcwd(NULL, 0);
 	if( currDir) {
-		printf("%s\n", currDir);
-//				free(dir);
-	}
+        if (Verbose) {
+            printf("Current directory: %s\n", currDir);
+        }
+    }
 #endif
 
-    int errorCode = runBath(argv[1], (const char **)(argv+2), argc-2);
+    InitMutex(&ParallellCommandMutex);
+    InitConditionVariable(&ParallellCommandWait);
+
+    const char* scriptFile = nullptr;
+
+    // comamnd line options
+    for(int i=1; i<argc; ++i) {
+        strref arg(argv[i]);
+        if(arg.grab_prefix("-")) {
+            if(arg.same_str("nocommands")) { RunCommands = false; }
+            else if(arg.same_str("commands")) { RunCommands = true; }
+            else if(arg.same_str("force-single-thread")) { ForceSingleThread = true; }
+            else if(arg.same_str("clean")) { Clean = true; }
+            else if(arg.same_str("rebuild")) { Rebuild = true; }
+            else if(arg.same_str("verbose")) { Verbose = true; }
+        } else if (scriptFile == nullptr) {
+            scriptFile = argv[i];
+        } else {
+            printf("Error: Unexpected argument: %s\n", argv[i]);
+            scriptFile = nullptr;
+        }
+    }
+
+    int errorCode = scriptFile ? runBath(scriptFile) : 1;
+
+    // Wait for all parallell commands to finish before exiting
+    SyncParallellCommands();
+
+    // Shut down systems
+    DestroyConditionVariable(&ParallellCommandWait);
+    DestroyMutex(&ParallellCommandMutex);
+
+    for (char* loadedFile : LoadedFiles) {
+        free(loadedFile);
+    }
+    LoadedFiles.clear();
+    for( char* includedFile : IncludedScriptFiles) {
+        free(includedFile);
+    }
+    IncludedScriptFiles.clear();
+    RegisteredTools.clear();
+
     return errorCode;
 }
