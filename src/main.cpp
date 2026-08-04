@@ -1,37 +1,21 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <direct.h>
-typedef HANDLE ThreadType;
-typedef LPTHREAD_START_ROUTINE ThreadFunction;
-typedef DWORD ThreadReturn;
-typedef void* ThreadArg;
-typedef LONG AtomicIntType;
-
-typedef CRITICAL_SECTION MutexType;
-typedef CONDITION_VARIABLE ConditionVariable;
-
 #endif
+
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
 #ifndef _WIN32
 #include <time.h>
-#include <unistd.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <pthread.h>
-typedef pthread_t ThreadType;
-typedef void* (*ThreadFunction)(void*);
-typedef void* ThreadReturn;
-typedef void* ThreadArg;
-typedef atomic_t AtomicIntType;
-
-typedef int MutexType;
-typedef pthread_cond_t ConditionVariable;
-
 #endif
+
 #define STRUSE_IMPLEMENTATION
 #include "struse/struse.h"
 
@@ -42,9 +26,23 @@ typedef pthread_cond_t ConditionVariable;
 #define _MAX_PATH 2048
 #endif
 
-// TODO:
-//  Commands can have multiple out files (c64addr -split)
-//  Commands can have multiple in files (minipak)
+#ifdef _WIN32
+typedef HANDLE ThreadType;
+typedef LPTHREAD_START_ROUTINE ThreadFunction;
+typedef DWORD ThreadReturn;
+typedef void* ThreadArg;
+typedef LONG AtomicIntType;
+typedef CRITICAL_SECTION MutexType;
+typedef CONDITION_VARIABLE ConditionVariable;
+#else
+typedef pthread_t ThreadType;
+typedef void* (*ThreadFunction)(void*);
+typedef void* ThreadReturn;
+typedef void* ThreadArg;
+typedef atomic_t AtomicIntType;
+typedef int MutexType;
+typedef pthread_cond_t ConditionVariable;
+#endif
 
 typedef enum BathStatus : uint8_t {
     BathStatus_Unset = 0,
@@ -52,6 +50,19 @@ typedef enum BathStatus : uint8_t {
     BathStatus_Execute,
     BathStatus_Finalize
 } BathStatus;
+
+typedef struct StringBuffer {
+    char buffer[4096-16];
+    size_t length;
+    StringBuffer* next;
+} StringBuffer;
+
+typedef struct BathTool {
+    strref name;        // Required "x65"
+    strref command;     // Required "../x65/x65"
+    strref mapping;     // Optional "fixed_args $Args -source=$In -out=$Out"
+    strref auto_out;    // Optional $Out = obj/$In.filename.x65
+} BathTool;
 
 #define MAX_REGISTERED_TOOLS 128
 #define MAX_PREVIOUS_INCLUDES 256
@@ -67,12 +78,24 @@ static bool Verbose = false;
 static bool Finalize = false;
 
 // string buffers for parallell command execution
-typedef struct StringBuffer {
-    char buffer[4096-16];
-    size_t length;
-    StringBuffer* next;
-} StringBuffer;
 StringBuffer *pParallellCommandLines = nullptr;
+
+BathTool RegisteredTools[MAX_REGISTERED_TOOLS];
+int RegisteredToolCount = 0;
+
+AtomicIntType NumberOfParallellCommands = 0;
+int MaxNumberOfParallellCommands = 8;
+int ParallellCommandError = 0;
+
+ConditionVariable ParallellCommandWait;
+MutexType ParallellCommandMutex;
+
+char* PreviousIncludes[MAX_PREVIOUS_INCLUDES];
+int PreviousIncludeCount = 0;
+
+static const strref match_filename = "filename";
+static const strref match_noext = "noext";
+static const strref match_path = "path";
 
 void StartThread(ThreadType *thread, size_t stack, ThreadFunction func, void* arg, const char *name) {
 	//ThreadType thread = 0;
@@ -109,8 +132,7 @@ void UnlockMutex(MutexType *m) {
 	LeaveCriticalSection(m);
 }
 
-void InitConditionVariable(ConditionVariable *c, MutexType *m) {
-	(void)m;
+void InitConditionVariable(ConditionVariable *c) {
 	InitializeConditionVariable(c);
 }
 
@@ -130,24 +152,22 @@ void AwakeConditionVariable(ConditionVariable *c) {
 void InitMutex(MutexType *m) {
 	pthread_mutexattr_t attr;
 	pthread_mutexattr_init(&attr);
-	pthread_mutex_init(&m->mutex, &attr);
+	pthread_mutex_init(m, &attr);
 }
 
 void DestroyMutex(MutexType *m) {
-	pthread_mutex_destroy(&m->mutex);
+	pthread_mutex_destroy(m);
 }
 
 void LockMutex(MutexType *m) {
-	pthread_mutex_lock(&m->mutex);
+	pthread_mutex_lock(m);
 }
 
 void UnlockMutex(MutexType *m) {
-	pthread_mutex_unlock(&m->mutex);
+	pthread_mutex_unlock(m);
 }
 
-
-void InitConditionVariable(ConditionVariable *c, MutexType *m) {
-	(void)m;
+void InitConditionVariable(ConditionVariable *c) {
 	pthread_cond_init(c, 0);
 }
 
@@ -156,7 +176,7 @@ void DestroyConditionVariable(ConditionVariable *c) {
 }
 
 void WaitConditionVariable(ConditionVariable *c, MutexType *m) {
-	pthread_cond_wait(c, &m->mutex);
+	pthread_cond_wait(c, m);
 }
 
 void AwakeConditionVariable(ConditionVariable *c) {
@@ -208,20 +228,7 @@ uint8_t *LoadFile(const char* path, size_t *outSize) {
     return nullptr;
 }
 
-
-// register a tool for the bath script
-typedef struct BathTool {
-    strref name;        // Required "x65"
-    strref command;     // Required "../x65/x65"
-    strref mapping;     // Optional "fixed_args $Args -source=$In -out=$Out"
-    strref auto_out;    // Optional $Out = obj/$In.filename.x65
-} BathTool;
-
-BathTool RegisteredTools[MAX_REGISTERED_TOOLS];
-int RegisteredToolCount = 0;
-
 int registerTool(strref line) {
-
     // get name of tool
     strref name = line.split_lang();
     line += name.get_len();
@@ -270,14 +277,6 @@ int registerTool(strref line) {
     RegisteredTools[RegisteredToolCount++] = tool;
     return 1;
 }
-
-
-AtomicIntType NumberOfParallellCommands = 0;
-int MaxNumberOfParallellCommands = 8;
-int ParallellCommandError = 0;
-
-ConditionVariable ParallellCommandWait;
-MutexType ParallellCommandMutex;
 
 ThreadReturn ParallellCommandThread(ThreadArg Arg) {
     // Run the command
@@ -331,10 +330,6 @@ bool RunParallellCommand(strovl commandline) {
     InterlockedIncrement(&NumberOfParallellCommands);
     return true;
 }
-
-static const strref match_filename = "filename";
-static const strref match_noext = "noext";
-static const strref match_path = "path";
 
 strovl replaceFileMatch(strovl shared, strref match, strref replace) {
     int pos = 0;
@@ -516,11 +511,7 @@ int executeLine(strref line, strref scriptFolder) {
     return 1;
 }
 
-
 int runBath(const char* scriptFile, const char **args, int argn);
-
-char* PreviousIncludes[MAX_PREVIOUS_INCLUDES];
-int PreviousIncludeCount = 0;
 
 int includeScript(strref line, strref scriptFolder, const char** args, int argn) {
     strref includePath = line.get_trimmed_ws();
