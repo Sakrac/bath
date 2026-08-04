@@ -5,6 +5,7 @@ typedef HANDLE ThreadType;
 typedef LPTHREAD_START_ROUTINE ThreadFunction;
 typedef DWORD ThreadReturn;
 typedef void* ThreadArg;
+typedef LONG AtomicIntType;
 
 typedef CRITICAL_SECTION MutexType;
 typedef CONDITION_VARIABLE ConditionVariable;
@@ -25,6 +26,7 @@ typedef pthread_t ThreadType;
 typedef void* (*ThreadFunction)(void*);
 typedef void* ThreadReturn;
 typedef void* ThreadArg;
+typedef atomic_t AtomicIntType;
 
 typedef int MutexType;
 typedef pthread_cond_t ConditionVariable;
@@ -54,9 +56,23 @@ typedef enum BathStatus : uint8_t {
 #define MAX_REGISTERED_TOOLS 128
 #define MAX_PREVIOUS_INCLUDES 256
 
+// controlled from command line arguments
 static bool ShowCommands = true;
 static bool RunCommands = false;
 static bool RunParallell = false;
+static bool ForceSingleThread = false;
+static bool Clean = false;
+static bool Rebuild = false;
+static bool Verbose = false;
+static bool Finalize = false;
+
+// string buffers for parallell command execution
+typedef struct StringBuffer {
+    char buffer[4096-16];
+    size_t length;
+    StringBuffer* next;
+} StringBuffer;
+StringBuffer *pParallellCommandLines = nullptr;
 
 void StartThread(ThreadType *thread, size_t stack, ThreadFunction func, void* arg, const char *name) {
 	//ThreadType thread = 0;
@@ -256,10 +272,63 @@ int registerTool(strref line) {
 }
 
 
-int NumberOfParallellCommands = 0;
+AtomicIntType NumberOfParallellCommands = 0;
 int MaxNumberOfParallellCommands = 8;
+int ParallellCommandError = 0;
+
+ConditionVariable ParallellCommandWait;
+MutexType ParallellCommandMutex;
+
+ThreadReturn ParallellCommandThread(ThreadArg Arg) {
+    // Run the command
+    const int exitCode = system((const char*)Arg);
+
+    // Output the failure and set the error code if the command failed
+    if (exitCode != 0) {
+        printf( "Command failed with exit code %d (%s)\n", exitCode, (const char*)Arg);
+        ParallellCommandError = exitCode;
+    }
+
+    InterlockedDecrement(&NumberOfParallellCommands);
+    WaitConditionVariable(&ParallellCommandWait, &ParallellCommandMutex);
+    return 0;
+}
+
+bool SyncParallellCommands() {
+    while (NumberOfParallellCommands > 0) {
+        LockMutex(&ParallellCommandMutex);
+        WaitConditionVariable(&ParallellCommandWait, &ParallellCommandMutex);
+        UnlockMutex(&ParallellCommandMutex);
+    }
+    return ParallellCommandError == 0;
+}
 
 bool RunParallellCommand(strovl commandline) {
+    while (NumberOfParallellCommands >= MaxNumberOfParallellCommands) {
+        LockMutex(&ParallellCommandMutex);
+        WaitConditionVariable(&ParallellCommandWait, &ParallellCommandMutex);
+        UnlockMutex(&ParallellCommandMutex);
+    }
+
+    if (ParallellCommandError != 0) {
+        printf("Skipping command because a previous command failed with exit code %d\n", ParallellCommandError);
+        return false;
+    }
+
+    // ensure space in the command line string buffer
+    if(pParallellCommandLines == nullptr || pParallellCommandLines->length + commandline.get_len() + 1 >= sizeof(pParallellCommandLines->buffer)) {
+        StringBuffer *newBuffer = (StringBuffer*)malloc(sizeof(StringBuffer));
+        newBuffer->length = 0;
+        newBuffer->next = pParallellCommandLines;
+        pParallellCommandLines = newBuffer;
+    }
+
+    char *commandlinePtr = pParallellCommandLines->buffer + pParallellCommandLines->length;
+    memcpy(commandlinePtr, commandline.charstr(), commandline.get_len());
+    pParallellCommandLines->length += commandline.get_len() + 1;
+
+    StartThread(nullptr, 0, ParallellCommandThread, (void*)&commandlinePtr, "ParallellCommand");
+    InterlockedIncrement(&NumberOfParallellCommands);
     return true;
 }
 
@@ -432,12 +501,14 @@ int executeLine(strref line, strref scriptFolder) {
                 return 0;
             }
 
-            if (!in_newer) {
+            if (!in_newer && !Rebuild) {
 				printf("Skipping command because output is newer than input: " STRREF_FMT "\n", STRREF_ARG(line));
 				return 0;
 			}
             
-
+            if (RunParallell) {
+                return RunParallellCommand(fullCommand);
+            }
             return runExternalCommand(fullCommand);
         }
     }
@@ -519,8 +590,10 @@ int runBath(const char* scriptFile, const char **args, int argn) {
                 continue;
             } else if (command.same_str("sync")) {
                 // wait for all parallall commands to finish before continuing
+                SyncParallellCommands();
                 continue;
             } else if (command.same_str("finalize")) {
+                SyncParallellCommands();
                 Status = BathStatus_Finalize;
                 continue;
             } else if (command.same_str("include")) {
