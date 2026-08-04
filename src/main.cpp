@@ -52,6 +52,14 @@ typedef enum BathStatus : uint8_t {
     BathStatus_Finalize
 } BathStatus;
 
+#if defined(_WIN32)
+#define AtomicIncrement(ptr) InterlockedIncrement((volatile LONG*)(ptr))
+#define AtomicDecrement(ptr) InterlockedDecrement((volatile LONG*)(ptr))
+#else
+#define AtomicIncrement(ptr) __sync_add_and_fetch((ptr), 1)
+#define AtomicDecrement(ptr) __sync_sub_and_fetch((ptr), 1)
+#endif
+
 typedef struct StringBuffer {
     char buffer[4096-16];
     size_t length;
@@ -64,9 +72,6 @@ typedef struct BathTool {
     strref mapping;     // Optional "fixed_args $Args -source=$In -out=$Out"
     strref auto_out;    // Optional $Out = obj/$In.filename.x65
 } BathTool;
-
-#define MAX_REGISTERED_TOOLS 128
-#define MAX_PREVIOUS_INCLUDES 256
 
 // controlled from command line arguments
 static bool ShowCommands = true;
@@ -92,28 +97,21 @@ int ParallellCommandError = 0;
 ConditionVariable ParallellCommandWait;
 MutexType ParallellCommandMutex;
 
-char* PreviousIncludes[MAX_PREVIOUS_INCLUDES];
-int PreviousIncludeCount = 0;
-
 static const strref match_filename = "filename";
 static const strref match_noext = "noext";
 static const strref match_path = "path";
 
 void StartThread(ThreadType *thread, size_t stack, ThreadFunction func, void* arg, const char *name) {
-	//ThreadType thread = 0;
 #if defined(_WIN32)
-	*thread = CreateThread(NULL, stack, func, arg, 0, NULL);
+    ThreadType newThread = CreateThread(NULL, stack, func, arg, 0, NULL);
+    if (thread) {
+        *thread = newThread;
+    }
 #else
-	pthread_create(thread, 0, func, arg);
-#endif
-}
-
-void ClearThread(ThreadType* thread) {
-#if defined(_WIN32)
-	if (thread) {
-		CloseHandle(*thread);
-	}
-#else
+    ThreadType newThread = pthread_create(thread, 0, func, arg);
+    if (thread) {
+        *thread = newThread;
+    }
 #endif
 }
 
@@ -215,17 +213,27 @@ uint8_t *LoadFile(const char* path, size_t *outSize) {
     FILE *file = nullptr;
     if (FOpen(file, path, "rb") && file) {
         fseek(file, 0, SEEK_END);
-        size_t size = ftell(file);
+        long size = ftell(file);
         fseek(file, 0, SEEK_SET);
-        uint8_t *buffer = (uint8_t*)malloc(size);
-        if (buffer) {
-            fread(buffer, 1, size, file);
+        if (size < 0) {
             fclose(file);
-            if (outSize) {
-                *outSize = size;
-            }
+            return nullptr;
         }
-        return buffer;
+
+        uint8_t *buffer = (uint8_t*)malloc(size_t(size));
+        if (buffer) {
+            size_t bytesRead = fread(buffer, 1, size_t(size), file);
+            fclose(file);
+            if (bytesRead != size_t(size)) {
+                free(buffer);
+                return nullptr;
+            }
+            if (outSize) {
+                *outSize = size_t(size);
+            }
+            return buffer;
+        }
+        fclose(file);
     }
     return nullptr;
 }
@@ -258,8 +266,6 @@ int registerTool(strref line) {
         return 1;
     }
 
-    printf("line after command: " STRREF_FMT "\n", STRREF_ARG(line));
-
     strref mapping = line.get_trimmed_ws();
     mapping.trim_surrounding_quotes().trim_whitespace();
 
@@ -286,7 +292,7 @@ ThreadReturn ParallellCommandThread(ThreadArg Arg) {
     }
 
     LockMutex(&ParallellCommandMutex);
-    InterlockedDecrement(&NumberOfParallellCommands);
+    AtomicDecrement(&NumberOfParallellCommands);
     AwakeConditionVariable(&ParallellCommandWait);
     UnlockMutex(&ParallellCommandMutex);
     return 0;
@@ -336,10 +342,10 @@ bool RunParallellCommand(strovl commandline) {
     commandlinePtr[commandline.get_len()] = 0;
     pParallellCommandLines->length += commandline.get_len() + 1;
 
-    InterlockedIncrement(&NumberOfParallellCommands);
+    AtomicIncrement(&NumberOfParallellCommands);
     UnlockMutex(&ParallellCommandMutex);
 
-    StartThread(nullptr, 0, ParallellCommandThread, (void*)&commandlinePtr, "ParallellCommand");
+    StartThread(nullptr, 0, ParallellCommandThread, (void*)commandlinePtr, "ParallellCommand");
     return true;
 }
 
@@ -516,7 +522,7 @@ int executeLine(strref line, strref scriptFolder) {
                 return 0;
             }
             
-            if (RunParallell) {
+            if (RunParallell && !ForceSingleThread) {
                 return RunParallellCommand(fullCommand);
             }
             return runExternalCommand(fullCommand);
@@ -549,7 +555,7 @@ int includeScript(strref line, strref scriptFolder) {
             return 0;
         }
     }
-    IncludedScriptFiles.push_back(_strdup(fullIncludePath.c_str()));
+    IncludedScriptFiles.push_back(dupCString(fullIncludePath.c_str()));
 
     return runBath(fullIncludePath.c_str());
 }
@@ -639,10 +645,41 @@ int runBath(const char* scriptFile) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        printf( "Usage: bath <script.sh>\n");
+    const char* scriptFile = nullptr;
+    bool sawScript = false;
+
+    // comamnd line options
+    for(int i=1; i<argc; ++i) {
+        strref arg(argv[i]);
+        if(arg.grab_prefix("-")) {
+            if(arg.same_str("nocommands")) { RunCommands = false; }
+            else if(arg.same_str("commands")) { RunCommands = true; }
+            else if(arg.same_str("force-single-thread")) { ForceSingleThread = true; }
+            else if(arg.same_str("clean")) { Clean = true; }
+            else if(arg.same_str("rebuild")) { Rebuild = true; }
+            else if(arg.same_str("verbose")) { Verbose = true; }
+            else {
+                printf("Error: Unknown argument: %s\n", argv[i]);
+                scriptFile = nullptr;
+                sawScript = true;
+                break;
+            }
+        } else if (!sawScript) {
+            scriptFile = argv[i];
+            sawScript = true;
+        } else {
+            printf("Error: Unexpected argument: %s\n", argv[i]);
+            scriptFile = nullptr;
+            sawScript = true;
+            break;
+        }
+    }
+
+    if (!sawScript || scriptFile == nullptr) {
+        printf("Usage: bath <script.sh>\n");
         return 1;
     }
+
 #ifdef _WIN32
     char currDir[512];
     GetCurrentDirectoryA(sizeof(currDir), currDir);
@@ -661,27 +698,7 @@ int main(int argc, char** argv) {
     InitMutex(&ParallellCommandMutex);
     InitConditionVariable(&ParallellCommandWait);
 
-    const char* scriptFile = nullptr;
-
-    // comamnd line options
-    for(int i=1; i<argc; ++i) {
-        strref arg(argv[i]);
-        if(arg.grab_prefix("-")) {
-            if(arg.same_str("nocommands")) { RunCommands = false; }
-            else if(arg.same_str("commands")) { RunCommands = true; }
-            else if(arg.same_str("force-single-thread")) { ForceSingleThread = true; }
-            else if(arg.same_str("clean")) { Clean = true; }
-            else if(arg.same_str("rebuild")) { Rebuild = true; }
-            else if(arg.same_str("verbose")) { Verbose = true; }
-        } else if (scriptFile == nullptr) {
-            scriptFile = argv[i];
-        } else {
-            printf("Error: Unexpected argument: %s\n", argv[i]);
-            scriptFile = nullptr;
-        }
-    }
-
-    int errorCode = scriptFile ? runBath(scriptFile) : 1;
+    int errorCode = runBath(scriptFile);
 
     // Wait for all parallell commands to finish before exiting
     SyncParallellCommands();
