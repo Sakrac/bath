@@ -80,7 +80,7 @@ typedef struct BathTool {
 
 // controlled from command line arguments
 static bool ShowCommands = true;
-static bool RunCommands = false;
+static bool RunCommands = true;
 static bool RunParallell = false;
 static bool ForceSingleThread = false;
 static bool Clean = false;
@@ -198,7 +198,7 @@ static char* dupCString(const char* text) {
 	return copy;
 }
 
-bool runExternalCommand(strref commandline) {
+int runExternalCommand(strref commandline) {
 	strown<_MAX_PATH> fullCommand(commandline);
 #ifdef _WIN32
 	fullCommand.replace('/', '\\');
@@ -209,9 +209,9 @@ bool runExternalCommand(strref commandline) {
 	const int exitCode = system(fullCommand.c_str());
 	if (exitCode != 0) {
 		printf("Command failed with exit code %d (" STRREF_FMT ")\n", exitCode, STRREF_ARG(fullCommand));
-		return false;
+		return exitCode;
 	}
-	return true;
+	return 0;
 }
 
 uint8_t* LoadFile(const char* path, size_t* outSize) {
@@ -317,7 +317,7 @@ bool SyncParallellCommands() {
 	return ParallellCommandError == 0;
 }
 
-bool RunParallellCommand(strref commandline) {
+int RunParallellCommand(strref commandline) {
 	LockMutex(&ParallellCommandMutex);
 	while (NumberOfParallellCommands >= MaxNumberOfParallellCommands) {
 		WaitConditionVariable(&ParallellCommandWait, &ParallellCommandMutex);
@@ -326,7 +326,7 @@ bool RunParallellCommand(strref commandline) {
 	if (ParallellCommandError != 0) {
 		UnlockMutex(&ParallellCommandMutex);
 		printf("Skipping command because a previous command failed with exit code %d\n", ParallellCommandError);
-		return false;
+		return 1;
 	}
 
 	// ensure space in the command line string buffer
@@ -346,7 +346,7 @@ bool RunParallellCommand(strref commandline) {
 	UnlockMutex(&ParallellCommandMutex);
 
 	StartThread(nullptr, 0, ParallellCommandThread, (void*)commandlinePtr, "ParallellCommand");
-	return true;
+	return 0;
 }
 
 strovl replaceFileMatch(strovl shared, strref match, strref replace) {
@@ -507,7 +507,7 @@ int executeLine(strref line, strref scriptFolder) {
 		return 0;
 	}
 
-	if (!ShowCommands && !in_newer) {
+	if (!in_newer && !Rebuild) {
 		if (Verbose) {
 			printf("Skipping command because output is newer than input: " STRREF_FMT "\n", STRREF_ARG(line));
 		}
