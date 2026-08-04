@@ -1,89 +1,107 @@
 # Bath
 
-Bath is intended to replace existing .bat / .sh files that run various tools to generate assets and programs to build something out of the outputs. The command line tools will be started in the order they are declared in the .bath file.
+Bath is a small build tool for running command pipelines from a single script. It is meant to replace handwritten .bat or .sh files for asset conversion, assembly, and other build steps.
 
-First declare the tools and the command line syntax. A line with \$Tool indicates that the tools declaration is following. The tool alias means that one tool can have different command line setups.
+A Bath script is read top to bottom. The tools are declared first, then execution commands are run, and an optional finalize section can run raw commands at the end.
 
-After the tools are declared the \$Execution block begins where each line contains the tool alias to use followed by the output(s) a colon then the input(s) and then additional arguments for this execution.
+## Script structure
 
-At the end a \$Finalize block begins that should just be raw command lines
+A Bath file usually has three parts:
+
+1. A tool declaration block started with `$tools`
+2. An execution block started with `$execution`
+3. An optional finalize block started with `$finalize`
 
 ## Directives
 
-* \$Include is follwed by a path to another .bath file to reference. Includes are tracked so only one instance will be included even if the same .bath is referenced multiple times
-* \$Tool starts a tool declaration block
-* \$Execution starts rumming command line tools
-* \$Parallelize starts running commands in multiple threads, add a number to limit the number of simultaneous threads (default 8)
-* \$Sync waits for all the parallellized executions to complete before continuing
-* \$Finalize starts the finalize execution. This is an optional and any parallellized execution will finish first.
+The current implementation recognizes these directives:
+
+- `$Include` followed by a path to another Bath file. Includes are tracked so the same file is only loaded once.
+- `$Tools` starts the tool declaration block.
+- `$Execution` starts the execution block.
+- `$Parallell` enables parallel execution for later commands.
+- `$Sequential` switches back to sequential execution.
+- `$Sync` waits for all currently running parallel commands to finish before continuing.
+- `$Finalize` starts the finalize block. Any parallel work is finished first.
+
+Directives ignore case so feel free to use any casing you are comfortable with, including uppercase spellings such as $TOOLS or $PARALLELL.
 
 ## Tool declaration
 
-\<tool alias\> \<tool path\> \<arguments\>
+A tool declaration looks like this:
 
-The inputs and outputs can be referenced by using \$In and \$Out in the arguments block.
-
-In addition the arguments block can reference \$Args that inserts additional arguments supplied for each command after the outputs and inputs.
-
-Note that \$Args is applied before \$In or \$Out so the per line custom arguments can refer to \$In or \$Out.
-
-It can be convenient to reference for instance just the filename without path or extension in the arguments so there are special filters for that
-
-$In.filename will evaluate to just the filename part and if you want to for example generate a listing file matching the source filename you can do it like this:
-
-```
-x65 ..\x65\x65 \$In -lst=lst\$In.filename.lst -obj obj\$Out -srcdbg
+```text
+tool_alias tool_path arguments
 ```
 
-note that .filename will resolve to the first input/output if there are multiple, the dot suffixes can however be chained.
+The command line for each execution can reference:
 
-Available filters:
-* \$In.filename - just the filename, no path, not extension
-* \$In.noext - trim the extension from the path
-* \$In.path - only the path without a trailing '/'
-* \$In.1 - first file of a multiple
-* \$In.<number> - indexed file of a multiple
+- `$In` for the input path or paths
+- `$Out` for the output path or paths
+- `$Args` for per-line arguments supplied in the execution block
 
-\$Out filters are the same as the \$In filters. And only the first file if multiple are speficied will be considered for filters.
+The replacement order is `$Args`, then `$In`, then `$Out`, so the per-line arguments can still refer to the file paths.
+
+It is often useful to reference only a filename or path component. Bath provides a small set of filters for this:
+
+- `$In.filename` - filename only, no path and no extension
+- `$In.noext` - path without the extension
+- `$In.path` - path without a trailing slash
+- `$In.1` - first file in a multi-file list
+- `$In.<number>` - indexed file in a multi-file list
+
+The same filters are available for `$Out`.
+
+Here is an example of a tool declaration:
+
+```
+$Tools
+
+x65 ..\x65\x65 $In -lst=lst\$In.filename.lst -obj $Out -srcdbg
+```
 
 ## Execution
 
-Inserting a line with `$Execution` starts the execution pass where each line starts with a tool alias followed by Outputs : Inputs \<optional args>
+After the `$execution` directive, each line starts with a tool alias followed by output(s), a colon, input(s), and optional extra arguments:
 
-```
+```text
 x65 obj/Game.x65 : src/game.s
 ```
 
-In this case .x65 is a linkable object file and .s is the source code that generates the object file.
+In this example, `.x65` is the generated object file and `.s` is the source that produces it.
 
-## Multiple inputs and outputs for a single command
+## Multiple inputs and outputs
 
-Put the inputs or outputs into parenthesis to supply multiple files, for instance an image might produce a charset, a screen map and a color map:
+Wrap multiple paths in parentheses to pass several files at once:
 
-```
+```text
 c64gfx (data/title.chr data/title.scr data/title.col) : assets/title.png -textmc
 ```
 
-The tool declaration for c64gfx might look like this:
+The matching tool declaration can then refer to `$Out` or `$In` as a group:
 
-```
-c64gfx ../C64Gfx/C64Gfx \$in \$Args -out=\$Out.noext
+```text
+c64gfx ../C64Gfx/C64Gfx $In $Args -out=$Out.noext
 ```
 
-Multiple inputs works the same way:
+Multiple inputs work the same way:
 
-```
+```text
 cruncher LevelBlob : (level.map level.chr level.col)
 ```
 
-## Command line arguments for bath
+## Command-line arguments for Bath
 
-* -clean: deletes all the output files and does not run commands by default
-* -rebuild: forces all commands to run regardless of time, can be combined with -clean
-* -echo_off: don't print command lines as they are executed
-* -verbose: output a lot more lines
-* -simulate: generate command lines and print them but don't execute them
-* -single: ignore $Parallelize
+The current implementation accepts these flags:
+
+- `-commands` - print commands and execute them
+- `-nocommands` - print commands without executing them
+- `single` or `-force-single-thread` - disable parallel execution even if `$parallell` is active
+- `-rebuild` - force commands to run even when the outputs look newer
+- `-verbose` - print extra diagnostic information
+- `-echo_off` - skip printing the command lines before execution
+
+A `-clean` flag is recognized in the parser, but the output-cleanup behavior is still a work in progress.
 
 ## Background
 
