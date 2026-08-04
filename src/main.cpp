@@ -1,6 +1,14 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <direct.h>
+typedef HANDLE ThreadType;
+typedef LPTHREAD_START_ROUTINE ThreadFunction;
+typedef DWORD ThreadReturn;
+typedef void* ThreadArg;
+
+typedef CRITICAL_SECTION MutexType;
+typedef CONDITION_VARIABLE ConditionVariable;
+
 #endif
 #include <sys/stat.h>
 #include <stdlib.h>
@@ -12,6 +20,15 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <pthread.h>
+typedef pthread_t ThreadType;
+typedef void* (*ThreadFunction)(void*);
+typedef void* ThreadReturn;
+typedef void* ThreadArg;
+
+typedef int MutexType;
+typedef pthread_cond_t ConditionVariable;
+
 #endif
 #define STRUSE_IMPLEMENTATION
 #include "struse/struse.h"
@@ -40,6 +57,96 @@ typedef enum BathStatus : uint8_t {
 static bool ShowCommands = true;
 static bool RunCommands = false;
 static bool RunParallell = false;
+
+void StartThread(ThreadType *thread, size_t stack, ThreadFunction func, void* arg, const char *name) {
+	//ThreadType thread = 0;
+#if defined(_WIN32)
+	*thread = CreateThread(NULL, stack, func, arg, 0, NULL);
+#else
+	pthread_create(thread, 0, func, arg);
+#endif
+}
+
+void ClearThread(ThreadType* thread) {
+#if defined(_WIN32)
+	if (thread) {
+		CloseHandle(*thread);
+	}
+#else
+#endif
+}
+
+#ifdef _WIN32
+void InitMutex(MutexType *m) {
+	InitializeCriticalSection(m);
+}
+
+void DestroyMutex(MutexType *m) {
+	DeleteCriticalSection(m);
+}
+
+void LockMutex(MutexType *m) {
+	EnterCriticalSection(m);
+}
+
+void UnlockMutex(MutexType *m) {
+	LeaveCriticalSection(m);
+}
+
+void InitConditionVariable(ConditionVariable *c, MutexType *m) {
+	(void)m;
+	InitializeConditionVariable(c);
+}
+
+void DestroyConditionVariable(ConditionVariable *c) {
+	(void)c;
+}
+
+void WaitConditionVariable(ConditionVariable *c, MutexType *m) {
+	SleepConditionVariableCS(c, m, INFINITE);
+}
+
+void AwakeConditionVariable(ConditionVariable *c) {
+	WakeConditionVariable(c);
+}
+
+#else
+void InitMutex(MutexType *m) {
+	pthread_mutexattr_t attr;
+	pthread_mutexattr_init(&attr);
+	pthread_mutex_init(&m->mutex, &attr);
+}
+
+void DestroyMutex(MutexType *m) {
+	pthread_mutex_destroy(&m->mutex);
+}
+
+void LockMutex(MutexType *m) {
+	pthread_mutex_lock(&m->mutex);
+}
+
+void UnlockMutex(MutexType *m) {
+	pthread_mutex_unlock(&m->mutex);
+}
+
+
+void InitConditionVariable(ConditionVariable *c, MutexType *m) {
+	(void)m;
+	pthread_cond_init(c, 0);
+}
+
+void DestroyConditionVariable(ConditionVariable *c) {
+	pthread_cond_destroy(c);
+}
+
+void WaitConditionVariable(ConditionVariable *c, MutexType *m) {
+	pthread_cond_wait(c, &m->mutex);
+}
+
+void AwakeConditionVariable(ConditionVariable *c) {
+	pthread_cond_signal(c);
+}
+#endif
 
 static char* dupCString(const char* text) {
     size_t len = strlen(text) + 1;
@@ -235,8 +342,13 @@ int executeLine(strref line, strref scriptFolder) {
 
     struct stat stat_in = {}, stat_out = {};
 
+    #ifdef _WIN32
+    time_t newest_in_time = 0;
+    time_t oldest_out_time = 0;
+    #else
     __time_t newest_in_time = 0;
     __time_t oldest_out_time = 0;
+    #endif
     bool in_exists = false;
     bool out_exists = false;
 
