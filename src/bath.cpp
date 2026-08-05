@@ -400,6 +400,20 @@ strovl replaceFileMatch(strovl shared, strref match, strref replace) {
 	return shared;
 }
 
+bool cleanFile(strref file) {
+#ifdef _WIN32
+    if (DeleteFileA(strown<_MAX_PATH>(file).c_str()) != 0) {
+#else
+    if(	remove(strown<_MAX_PATH>(file).c_str()) == 0 ) {
+#endif
+        if (Verbose) {
+            printf("Removed output file: " STRREF_FMT "\n", STRREF_ARG(file));
+        }
+        return true;
+    }
+    return false;
+}
+
 int executeLine(strref line, strref scriptFolder) {
 	strref name = line.split_lang();
 	line.skip_whitespace();
@@ -453,15 +467,7 @@ int executeLine(strref line, strref scriptFolder) {
 		strref all_out = out.trim_surrounding_parens().get_trimmed_ws();
 		while (strref out_multi = all_out.split_path()) {
 			if (Clean) {
-#ifdef _WIN32
-				if (DeleteFileA(strown<_MAX_PATH>(out_multi).c_str()) != 0) {
-					if (Verbose) {
-						printf("Removed output file: " STRREF_FMT "\n", STRREF_ARG(out_multi));
-					}
-				}
-#else
-
-#endif
+                cleanFile(out_multi);
 			} else {
 				int stat_out_result = stat(strown<_MAX_PATH>(out_multi).c_str(), &stat_out);
 				if (stat_out_result == 0) {
@@ -473,15 +479,7 @@ int executeLine(strref line, strref scriptFolder) {
 			}
 		}
 	} else if (Clean) {
-#ifdef _WIN32
-		if (DeleteFileA(strown<_MAX_PATH>(out).c_str()) != 0) {
-			if (Verbose) {
-				printf("Removed output file: " STRREF_FMT "\n", STRREF_ARG(out));
-			}
-		}
-#else
-
-#endif
+        cleanFile(out);
 	} else {
 		int stat_out_result = stat(strown<_MAX_PATH>(out).c_str(), &stat_out);
 		out_exists = (stat_out_result == 0);
