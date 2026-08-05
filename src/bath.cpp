@@ -96,6 +96,7 @@ int TotalOutputFiles = 0;
 
 static const strref match_filename = "filename";
 static const strref match_noext = "noext";
+static const strref match_noext_all = "noext_all";
 static const strref match_path = "path";
 
 #ifdef _WIN32
@@ -428,18 +429,29 @@ strovl replaceFileMatch(strovl shared, strref match, strref replace) {
 	}
 
 	do {
+		strown<2048> workspace;
 		pos = shared.find(match, pos);
 		strref rep = replace;
 		strl_t match_len = match.get_len();
 		if (pos >= 0) {
 			if (shared[pos + match_len] == '.') {
-				if ((shared + pos + match_len + 1).has_prefix(match_filename)) {
+				strref shared_match = (shared + pos + match_len + 1);
+				if (shared_match.has_prefix(match_filename)) {
 					match_len += match_filename.get_len() + 1;
+					rep = rep.split_path();
 					rep = rep.after_last_or_full(LINUX_FOLDER_SEPARATOR, WINDOWS_FOLDER_SEPARATOR).before_last_or_full('.', '.');
-				} else if ((shared + pos + match_len + 1).has_prefix(match_noext)) {
+				} else if (shared_match.has_prefix(match_noext_all)) {
+					match_len += match_noext_all.get_len() + 1;
+					workspace.clear();
+					while(strref file = rep.split_path()) {
+						workspace.append(file.before_last('.')).append(' ');
+					}
+					rep = workspace.get_strref();
+				} else if (shared_match.has_prefix(match_noext)) {
 					match_len += match_noext.get_len() + 1;
+					rep = rep.split_path();
 					rep = rep.before_last_or_full('.');
-				} else if ((shared + pos + match_len + 1).has_prefix(match_path)) {
+				} else if (shared_match.has_prefix(match_path)) {
 					match_len += match_path.get_len() + 1;
 					rep = rep.before_last_or_full(LINUX_FOLDER_SEPARATOR, WINDOWS_FOLDER_SEPARATOR	);
 				} else if (strref::is_number(shared[pos + match_len + 1])) {
@@ -519,7 +531,19 @@ int executeLine(strref line, strref scriptFolder) {
 
 	// command out : in args
 	strref out = params.next_token(':').get_trimmed_ws(); ++params; params.skip_whitespace();
-	strref in = params.next_token(' ').get_trimmed_ws();
+	strref in;
+	if (params.get_first()=='(') {
+		int close_param = params.find(')');
+		if (close_param<0) {
+			printf("Expected closing parenthesis\n");
+			return 1;
+		}
+		in = params.get_clipped((strl_t)close_param + 1);
+		params.skip(in.get_len());
+		params.skip_whitespace();
+	} else {
+		in = params.next_token(' ').get_trimmed_ws();
+	}
 	strref args = params.get_trimmed_ws();
 
 	in.trim_surrounding_quotes().trim_whitespace();
@@ -542,6 +566,8 @@ int executeLine(strref line, strref scriptFolder) {
 				if (stat_in.st_mtime > newest_in_time || newest_in_time == 0) {
 					newest_in_time = stat_in.st_mtime;
 				}
+			} else {
+				__nop();
 			}
 			++TotalInputFiles;
 		}
@@ -551,7 +577,7 @@ int executeLine(strref line, strref scriptFolder) {
 		newest_in_time = in_exists ? stat_in.st_mtime : 0;
 		++TotalInputFiles;
 	}
-	if (!in_exists) {
+	if (!in_exists && (!Clean || Rebuild)) {
 		PrintfW("Input file does not exist: " STRREF_FMT "\n", STRREF_ARG(in));
 		return 1;
 	}

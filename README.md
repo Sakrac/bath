@@ -6,6 +6,8 @@ A bath script is read top to bottom. The tools are declared first, then executio
 
 Bath is essentially `make` but for running various tools in a specific order rather than compiling all touched files for a project.
 
+The repo for Bath is located at https://github.com/sakrac/bath
+
 ## Simplified rule based execution
 
 While at first glance the bath file structure might be intimidating it is intended to be intuitive. The best way to think of it is probably this:
@@ -15,6 +17,8 @@ While at first glance the bath file structure might be intimidating it is intend
 3. Finalize by running specific command lines to merge the cartridge or build a floppy disk image
 
 I will keep experimenting to make the process more intuitive as I convert my own projets one by one.
+
+Please note that unicode files are fully supported and the .bath files are expected to be saved as utf-8 with or without BOM. There are test files with Japanese paths to test this but if anything unexpected happens just file an issue in github.
 
 ## Script structure
 
