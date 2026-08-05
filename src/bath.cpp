@@ -3,10 +3,6 @@
 // - instead of regression coverage for include handling, parallel/sync behavior, and CLI flag parsing I will apply this tool to multiple projects and manually test the features
 // - Track stats (total time, number of inputs, outputs, commands executed, commands skipped, etc.) and print a summary at the end of execution.
 
-#ifdef _WIN32
-#include <windows.h>
-#include <direct.h>
-#endif
 
 #include <sys/stat.h>
 #include <stdlib.h>
@@ -14,7 +10,10 @@
 #include <stdio.h>
 #include <vector> // Note: Avoiding std includes but vector is useful.
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#include <direct.h>
+#else
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -45,8 +44,8 @@ typedef pthread_t ThreadType;
 typedef void* (*ThreadFunction)(void*);
 typedef void* ThreadReturn;
 typedef void* ThreadArg;
-typedef atomic_t AtomicIntType;
-typedef int MutexType;
+typedef int AtomicIntType;
+typedef pthread_mutex_t MutexType;
 typedef pthread_cond_t ConditionVariable;
 #endif
 
@@ -60,9 +59,11 @@ typedef enum BathStatus : uint8_t {
 #if defined(_WIN32)
 #define AtomicIncrement(ptr) InterlockedIncrement((volatile LONG*)(ptr))
 #define AtomicDecrement(ptr) InterlockedDecrement((volatile LONG*)(ptr))
+typedef time_t FileTime;
 #else
 #define AtomicIncrement(ptr) __sync_add_and_fetch((ptr), 1)
 #define AtomicDecrement(ptr) __sync_sub_and_fetch((ptr), 1)
+typedef __time_t FileTime;
 #endif
 
 typedef struct StringBuffer {
@@ -421,14 +422,10 @@ int executeLine(strref line, strref scriptFolder) {
 
 	struct stat stat_in = {}, stat_out = {};
 
-#ifdef _WIN32
-	time_t newest_in_time = 0;
-	time_t oldest_out_time = 0;
-#else
-	__time_t newest_in_time = 0;
-	__time_t oldest_out_time = 0;
-#endif
-	bool in_exists = false;
+	FileTime newest_in_time = 0;
+	FileTime oldest_out_time = 0;
+
+    bool in_exists = false;
 	bool out_exists = false;
 
 	if (in.get_first() == '(' && in.get_last() == ')') {
