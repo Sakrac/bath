@@ -31,6 +31,17 @@
 #define _MAX_PATH 2048
 #endif
 
+#define WINDOWS_FOLDER_SEPARATOR '\\'
+#define LINUX_FOLDER_SEPARATOR '/'
+#ifdef _WIN32
+#define WANTED_FOLDER_SEPARATOR WINDOWS_FOLDER_SEPARATOR
+#define UNWANTED_FOLDER_SEPARATOR LINUX_FOLDER_SEPARATOR
+#else
+#define WANTED_FOLDER_SEPARATOR LINUX_FOLDER_SEPARATOR
+#define UNWANTED_FOLDER_SEPARATOR WINDOWS_FOLDER_SEPARATOR
+#endif
+
+
 #ifdef _WIN32
 typedef HANDLE ThreadType;
 typedef LPTHREAD_START_ROUTINE ThreadFunction;
@@ -204,11 +215,7 @@ static char* dupCString(const char* text) {
 
 int runExternalCommand(strref commandline) {
 	strown<_MAX_PATH> fullCommand(commandline);
-#ifdef _WIN32
-	fullCommand.replace('/', '\\');
-#else
-	fullCommand.replace('\\', '/');
-#endif
+	fullCommand.replace(UNWANTED_FOLDER_SEPARATOR, WANTED_FOLDER_SEPARATOR);
 
 	const int exitCode = system(fullCommand.c_str());
 	if (exitCode != 0) {
@@ -392,13 +399,13 @@ strovl replaceFileMatch(strovl shared, strref match, strref replace) {
 			if (shared[pos + match_len] == '.') {
 				if ((shared + pos + match_len + 1).has_prefix(match_filename)) {
 					match_len += match_filename.get_len() + 1;
-					rep = rep.after_last_or_full('/', '\\').before_last_or_full('.', '.');
+					rep = rep.after_last_or_full(LINUX_FOLDER_SEPARATOR, WINDOWS_FOLDER_SEPARATOR).before_last_or_full('.', '.');
 				} else if ((shared + pos + match_len + 1).has_prefix(match_noext)) {
 					match_len += match_noext.get_len() + 1;
 					rep = rep.before_last_or_full('.');
 				} else if ((shared + pos + match_len + 1).has_prefix(match_path)) {
 					match_len += match_path.get_len() + 1;
-					rep = rep.before_last_or_full('/', '\\');
+					rep = rep.before_last_or_full(LINUX_FOLDER_SEPARATOR, WINDOWS_FOLDER_SEPARATOR	);
 				} else if (strref::is_number(shared[pos + match_len + 1])) {
 					rep = all_files;
 					int index = (shared + pos + match_len + 1).atoi();
@@ -436,6 +443,10 @@ bool cleanFile(strref file) {
     return false;
 }
 
+int GetFileStat(strref file, struct stat* outStat) {
+	return stat(strown<_MAX_PATH>(file).replace(UNWANTED_FOLDER_SEPARATOR, WANTED_FOLDER_SEPARATOR).c_str(), outStat);
+}
+
 int executeLine(strref line, strref scriptFolder) {
 	strref name = line.split_lang();
 	line.skip_whitespace();
@@ -467,7 +478,7 @@ int executeLine(strref line, strref scriptFolder) {
 	if (in.get_first() == '(' && in.get_last() == ')') {
 		strref all_in = in.trim_surrounding_parens().get_trimmed_ws();
 		while (strref in_multi = all_in.split_path()) {
-			int stat_in_result = stat(strown<_MAX_PATH>(in_multi).c_str(), &stat_in);
+			int stat_in_result = GetFileStat(in_multi, &stat_in);
 			if (stat_in_result == 0) {
 				in_exists = true;
 				if (stat_in.st_mtime > newest_in_time || newest_in_time == 0) {
@@ -477,7 +488,7 @@ int executeLine(strref line, strref scriptFolder) {
 			++TotalInputFiles;
 		}
 	} else {
-		int stat_in_result = stat(strown<_MAX_PATH>(in).c_str(), &stat_in);
+		int stat_in_result = GetFileStat(in, &stat_in);
 		in_exists = (stat_in_result == 0);
 		newest_in_time = in_exists ? stat_in.st_mtime : 0;
 		++TotalInputFiles;
@@ -493,7 +504,7 @@ int executeLine(strref line, strref scriptFolder) {
 			if (Clean) {
                 cleanFile(out_multi);
 			} else {
-				int stat_out_result = stat(strown<_MAX_PATH>(out_multi).c_str(), &stat_out);
+				int stat_out_result = GetFileStat(out_multi, &stat_out);
 				if (stat_out_result == 0) {
 					out_exists = true;
 					if (stat_out.st_mtime < oldest_out_time || oldest_out_time == 0) {
@@ -507,7 +518,7 @@ int executeLine(strref line, strref scriptFolder) {
         cleanFile(out);
 		++TotalOutputFiles;
 	} else {
-		int stat_out_result = stat(strown<_MAX_PATH>(out).c_str(), &stat_out);
+		int stat_out_result = GetFileStat(out, &stat_out);
 		out_exists = (stat_out_result == 0);
 		oldest_out_time = out_exists ? stat_out.st_mtime : 0;
 		++TotalOutputFiles;
@@ -544,12 +555,9 @@ int executeLine(strref line, strref scriptFolder) {
 			fullCommand.set_len(replaceFileMatch(fullCommand, "$In", in).get_len());
 			fullCommand.set_len(replaceFileMatch(fullCommand, "$Out", out).get_len());
 
-#ifdef _WIN32
-			fullCommand.replace('/', '\\');
-#else
-			fullCommand.replace('\\', '/');
-#endif
-			if (ShowCommands) {
+			fullCommand.replace(UNWANTED_FOLDER_SEPARATOR, WANTED_FOLDER_SEPARATOR);
+
+			if (ShowCommands || Verbose) {
 				printf(STRREF_FMT "\n", STRREF_ARG(fullCommand));
 			}
 
@@ -573,7 +581,7 @@ int executeLine(strref line, strref scriptFolder) {
 	printf("Error: Tool not registered: " STRREF_FMT "\n", STRREF_ARG(name));
 	return 1;
 }
-
+	
 int runBath(const char* scriptFile);
 
 int includeScript(strref line, strref scriptFolder) {
@@ -584,7 +592,7 @@ int includeScript(strref line, strref scriptFolder) {
 		fullIncludePath.copy(includePath);
 	} else {
 		fullIncludePath.copy(scriptFolder);
-		fullIncludePath.append("/");
+		fullIncludePath.append('/');
 		fullIncludePath.append(includePath);
 	}
 
@@ -619,7 +627,7 @@ int runBath(const char* scriptFile) {
 	BathStatus Status = BathStatus_Unset;
 
 	// path from current working folder
-	strref path(strref(scriptFile).before_last_or_full('/', '\\'));
+	strref path(strref(scriptFile).before_last_or_full(LINUX_FOLDER_SEPARATOR, WINDOWS_FOLDER_SEPARATOR));
 
 	strref scriptRef((const char*)script, (strl_t)scriptSize), file(scriptRef);
 	while (strref line = file.line()) {

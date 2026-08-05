@@ -1087,8 +1087,8 @@ public:
 		int l = vsnprintf(end(), cap()-len(), format, args); va_end(args); add_len_int(l); return l; }
 #endif
 	// replace instances of character c with character d
-	strref replace(char c, char d) { if (char *b = charstr()) {
-		for (strl_t i = len(); i; i--) { if (*b==c) *b = d; b++; } } return get_strref(); }
+	strmod replace(char c, char d) { if (char *b = charstr()) {
+		for (strl_t i = len(); i; i--) { if (*b==c) *b = d; b++; } } return *this; }
 
 	// replace instances of substring a with substring b
 	strref replace(const strref a, const strref b) {
