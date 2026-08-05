@@ -2,7 +2,7 @@ $Tools
 
 x65 ..\x65\x65 $In -lst=lst\$In.filename.lst -obj obj\$Out -srcdbg
 
-$Execute
+$Execution
 
 x65 obj/DebugView.x65 : src/debugview.s
 x65 obj/DebugJump.x65 : src/debugjump.s

@@ -1,5 +1,4 @@
 // TODO: Keep the README and the implementation in sync.
-// - (only linux) Implement the documented -clean behavior so it actually removes outputs before execution.
 // - instead of regression coverage for include handling, parallel/sync behavior, and CLI flag parsing I will apply this tool to multiple projects and manually test the features
 // - Track stats (total time, number of inputs, outputs, commands executed, commands skipped, etc.) and print a summary at the end of execution.
 
@@ -9,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <vector> // Note: Avoiding std includes but vector is useful.
+#include <errno.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -80,14 +80,14 @@ typedef struct BathTool {
 } BathTool;
 
 // controlled from command line arguments
-static bool ShowCommands = true;
-static bool RunCommands = true;
-static bool RunParallell = false;
-static bool ForceSingleThread = false;
-static bool Clean = false;
-static bool Rebuild = false;
-static bool Verbose = false;
-static bool Finalize = false;
+bool ShowCommands = true;
+bool RunCommands = true;
+bool RunParallell = false;
+bool ForceSingleThread = false;
+bool Clean = false;
+bool Rebuild = false;
+bool Verbose = false;
+bool Finalize = false;
 
 // string buffers for parallell command execution
 StringBuffer* pParallellCommandLines = nullptr;
@@ -102,6 +102,9 @@ int ParallellCommandError = 0;
 
 ConditionVariable ParallellCommandWait;
 MutexType ParallellCommandMutex;
+
+int TotalInputFiles = 0;
+int TotalOutputFiles = 0;
 
 static const strref match_filename = "filename";
 static const strref match_noext = "noext";
@@ -222,6 +225,9 @@ uint8_t* LoadFile(const char* path, size_t* outSize) {
 		long size = ftell(file);
 		fseek(file, 0, SEEK_SET);
 		if (size < 0) {
+            if (Verbose) {
+                printf("Failed to get file size for: %s\n", path);
+            }
 			fclose(file);
 			return nullptr;
 		}
@@ -229,18 +235,29 @@ uint8_t* LoadFile(const char* path, size_t* outSize) {
 		uint8_t* buffer = (uint8_t*)malloc(size_t(size));
 		if (buffer) {
 			size_t bytesRead = fread(buffer, 1, size_t(size), file);
-			fclose(file);
 			if (bytesRead != size_t(size)) {
+                if (Verbose) {
+                    printf("Failed to read file data: %s\n", path);
+                }
+				fclose(file);
 				free(buffer);
 				return nullptr;
 			}
 			if (outSize) {
 				*outSize = size_t(size);
 			}
+			fclose(file);
 			return buffer;
-		}
+        } else if (Verbose) {
+            printf("Failed to alloc buffer for: %s\n", path);
+        }
 		fclose(file);
 	}
+    
+    if (Verbose) {
+        printf("Could not open file errno %d: %s\n", errno, path);
+    }
+
 	return nullptr;
 }
 
@@ -277,6 +294,11 @@ int registerTool(strref line) {
 
 	BathTool tool = { name, command, mapping };
 	RegisteredTools.push_back(tool);
+
+	if (Verbose) {
+		printf("Registered tool " STRREF_FMT "\n", STRREF_ARG(name));
+	}
+
 	return 1;
 }
 
@@ -452,11 +474,13 @@ int executeLine(strref line, strref scriptFolder) {
 					newest_in_time = stat_in.st_mtime;
 				}
 			}
+			++TotalInputFiles;
 		}
 	} else {
 		int stat_in_result = stat(strown<_MAX_PATH>(in).c_str(), &stat_in);
 		in_exists = (stat_in_result == 0);
 		newest_in_time = in_exists ? stat_in.st_mtime : 0;
+		++TotalInputFiles;
 	}
 	if (!in_exists) {
 		printf("Input file does not exist: " STRREF_FMT "\n", STRREF_ARG(in));
@@ -477,13 +501,16 @@ int executeLine(strref line, strref scriptFolder) {
 					}
 				}
 			}
+			++TotalOutputFiles;
 		}
 	} else if (Clean) {
         cleanFile(out);
+		++TotalOutputFiles;
 	} else {
 		int stat_out_result = stat(strown<_MAX_PATH>(out).c_str(), &stat_out);
 		out_exists = (stat_out_result == 0);
 		oldest_out_time = out_exists ? stat_out.st_mtime : 0;
+		++TotalOutputFiles;
 	}
 
 	bool in_newer = false;
@@ -582,6 +609,8 @@ int runBath(const char* scriptFile) {
 	if (!script) {
 		printf("Failed to load bath script: %s\n", scriptFile);
 		return 1;
+	} else if (Verbose) {
+		printf("Loaded bath script: %s (%zu bytes)\n", scriptFile, scriptSize);
 	}
 
 	// remember the loaded script so it can be freed later
@@ -602,28 +631,49 @@ int runBath(const char* scriptFile) {
 			strref command = line.get_word();
 			line += command.get_len();
 			if (command.same_str("tools")) {
+				if (Verbose) {
+					printf("Switching to tools registration mode\n");
+				}
 				Status = BathStatus_Tools;
 				continue;
 			} else if (command.same_str("execution")) {
+				if (Verbose) {
+					printf("Switching to execution mode\n");
+				}
 				Status = BathStatus_Execute;
 				continue;
 			} else if (command.same_str("parallel") || command.same_str("parallell")) {
 				RunParallell = true;
 				Status = BathStatus_Execute;
+				if (Verbose) {
+					printf("Parallellizing\n");
+				}
 				continue;
 			} else if (command.same_str("sequential")) {
 				RunParallell = false;
 				SyncParallellCommands();
 				Status = BathStatus_Execute;
+				if (Verbose) {
+					printf("Sequentializing\n");
+				}
 				continue;
 			} else if (command.same_str("sync")) {
+				if (Verbose) {
+					printf("Synchronizing\n");
+				}
 				SyncParallellCommands();
 				continue;
 			} else if (command.same_str("finalize")) {
+				if (Verbose) {
+					printf("Finalizing\n");
+				}
 				SyncParallellCommands();
 				Status = BathStatus_Finalize;
 				continue;
 			} else if (command.same_str("include")) {
+				if (Verbose) {
+					printf("Including script " STRREF_FMT "\n", STRREF_ARG(line));
+				}
 				includeScript(line, path);
 				continue;
 			}
@@ -662,6 +712,9 @@ int runBath(const char* scriptFile) {
 int main(int argc, char** argv) {
 	const char* scriptFile = nullptr;
 	bool sawScript = false;
+
+	struct timespec startTime = {};
+	clock_gettime(CLOCK_MONOTONIC, &startTime);
 
 	// comamnd line options
 	for (int i = 1; i < argc; ++i) {
@@ -735,6 +788,15 @@ int main(int argc, char** argv) {
 	}
 	IncludedScriptFiles.clear();
 	RegisteredTools.clear();
+
+	struct timespec endTime = {};
+	clock_gettime(CLOCK_MONOTONIC, &endTime);
+	if (Verbose) {
+		printf("Total execution time: %ld.%09ld seconds\n", endTime.tv_sec - startTime.tv_sec, endTime.tv_nsec - startTime.tv_nsec);
+		printf("Total input files: %d\n", TotalInputFiles);
+		printf("Total output files: %d\n", TotalOutputFiles);
+	}
+
 
 	return errorCode;
 }
