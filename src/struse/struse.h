@@ -288,7 +288,8 @@ public:
 			(str.get_len()==length || !is_alphanumeric((uint8_t)str[length])); }
 	bool is_prefix_case_of(const strref str) const { return prefix_len_case(str)==get_len(); }
 	bool is_prefix_float_number() const { return len_float_number() > 0; }
-	bool grab_prefix( const char* str ) { strl_t p = prefix_len( str ); if( !str[ p ] ) { skip( p ); return true; } return false; }
+	bool grab_prefix(const char* str ) { strl_t p = prefix_len( str ); if( !str[ p ] ) { skip( p ); return true; } return false; }
+	bool grab_prefix(char c) { if (!valid()) { return false; } if (*string == c) { skip(1); return true; } return false; }
 
 	// suffix compare
 	strl_t suffix_len(const strref str) const;
@@ -483,6 +484,9 @@ public:
 
 	// length of a file path consisting of alphanumeric characters, underscores, hyphens and periods, can be quoted
 	strl_t len_path() const;
+
+	// length of a block starting with ( and ending with )
+	strl_t len_parens() const;
 
 	// length of string with escape characters
 	strl_t len_esc() const;
@@ -685,6 +689,7 @@ public:
 	strref split_label();
 	strref split_lang();
 	strref split_num();
+	strref split_parens();
 	strref split_path();
 
 	strref trim_surrounding_quotes() {
@@ -4468,6 +4473,13 @@ strref strref::split_num() {
 	return r;
 }
 
+strl_t strref::len_parens() const {
+	if (!valid() || get_first() != '(') { return 0; }
+	int end = find_quoted(')');
+	if (end < 0) { return 0; }
+	return (strl_t)end + 1;
+}
+
 strl_t strref::len_path() const {
 	if(!valid()) { return strref(); }
 
@@ -4500,6 +4512,17 @@ strref strref::split_path() {
 	skip_whitespace();
 	return r;
 }
+
+strref strref::split_parens() {
+	trim_whitespace();
+	strl_t split = len_parens();
+	strref r(string, split);
+	skip(split);
+	skip_whitespace();
+	return r;
+}
+
+
 // split string based on common programming tokens (words, quotes, scopes, numbers)
 strref strref::split_lang()
 {

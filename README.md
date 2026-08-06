@@ -2,7 +2,7 @@
 
 Bath is a small build tool for running command pipelines from a single script. It is meant to replace handwritten .bat or .sh files for asset conversion, assembly, and other build steps.
 
-A bath script is read top to bottom. The tools are declared first, then execution commands are run, and an optional finalize section can run raw commands at the end.
+A bath script is read top to bottom. The tools are declared first, then execution commands are run.
 
 Bath is essentially `make` but for running various tools in a specific order rather than compiling all touched files for a project.
 
@@ -14,19 +14,23 @@ While at first glance the bath file structure might be intimidating it is intend
 
 1. Set up each tool alias as a macro using the keywords $In, $Out and $Args
 2. Execute the commands by putting `tool alias`, then `output` : `input` followed by per command `arguments`
-3. Finalize by running specific command lines to merge the cartridge or build a floppy disk image
 
 I will keep experimenting to make the process more intuitive as I convert my own projets one by one.
 
-Please note that unicode files are fully supported and the .bath files are expected to be saved as utf-8 with or without BOM. There are test files with Japanese paths to test this but if anything unexpected happens just file an issue in github.
+Note that unicode files are *fully supported* and the .bath files are expected to be saved as utf-8 with or without BOM. There are test files with Japanese paths to test this but if anything unexpected happens just file an issue in github.
+
+## Example
+
+I converted the build files for a commodore 64 demo I made in 2019 to show a "working" example (it works on my computer). When changing a single assembly source this enables a 25x build time speedup.
+
+[Example.md](EXAMPLE.md)
 
 ## Script structure
 
-A bath file usually has three parts:
+A bath file usually has two parts:
 
 1. A tool declaration block started with `$Tools`
 2. An execution block started with `$Execution`
-3. An optional finalize block started with `$Finalize`
 
 ## Directives
 
@@ -38,7 +42,9 @@ The current implementation recognizes these directives:
 - `$Parallel` or `$Parallell` enables parallel execution for the following commands.
 - `$Sequential` switches back to sequential execution after waiting for all parallel commands to finish.
 - `$Sync` waits for all currently running parallel commands to finish before continuing, but leaves parallel mode as it was.
-- `$Finalize` starts the finalize block. Any parallel work is finished first.
+- `$Raw` regular command lines follow, always runs. Useful while porting a .bat or .sh file to a full .bath file
+- `$Ignore` or `$IgnoreErrors` keeps running even if errors are enoountered including if input files are missing. `$Ignore off` will re-enable error checking.
+- `$Error` enables error checking if disabled with a `$Ignore`
 
 Directives ignore case so feel free to use any casing you are comfortable with, including uppercase spellings such as $TOOLS or $PARALLELL.
 
@@ -125,6 +131,8 @@ The current implementation accepts these flags:
 - `-rebuild` - force commands to run even when the outputs are newer than the inputs. Can be combined with `-clear` to first delete then rebuild.
 - `-verbose` - print extra diagnostic information
 - `-echo_off` - skip printing the command lines before execution
+- `-stats` - show timing and file counts
+- `show_commands` - print all evaluated command lines and don't run or check file times.
 
 ## Example
 
@@ -161,7 +169,10 @@ $Sequential
 # so run one command at a time from here.
 assemble cart.bin : src/link.s
 
-$Finalize
+# Complete the process with a single raw command line
+
+$Raw
+
 tools/cartconv cart.bin cart.srd
 ```
 

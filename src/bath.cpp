@@ -30,6 +30,8 @@
 #define UNWANTED_FOLDER_SEPARATOR WINDOWS_FOLDER_SEPARATOR
 #endif
 
+#define MAX_COMMAND_LINE_CHARS 4096
+
 #ifdef _WIN32
 typedef HANDLE ThreadType;
 typedef LPTHREAD_START_ROUTINE ThreadFunction;
@@ -52,7 +54,7 @@ typedef enum BathStatus : uint8_t {
 	BathStatus_Unset = 0,
 	BathStatus_Tools,
 	BathStatus_Execute,
-	BathStatus_Finalize
+	BathStatus_RawCommands
 } BathStatus;
 
 typedef struct StringBuffer {
@@ -71,25 +73,27 @@ typedef struct BathTool {
 // controlled from command line arguments
 bool ShowCommands = true;
 bool RunCommands = true;
-bool RunParallell = false;
+bool RunParallel = false;
+bool IgnoreErrors = false;
 bool ForceSingleThread = false;
 bool Clean = false;
 bool Rebuild = false;
 bool Verbose = false;
+bool ShowStats = false;
 
-// string buffers for parallell command execution
-StringBuffer* pParallellCommandLines = nullptr;
+// string buffers for parallel command execution
+StringBuffer* pParallelCommandLines = nullptr;
 
 std::vector<char*> IncludedScriptFiles;
 std::vector<BathTool> RegisteredTools;
 std::vector<char*> LoadedFiles;
 
-AtomicIntType NumberOfParallellCommands = 0;
-int MaxNumberOfParallellCommands = 8;
-int ParallellCommandError = 0;
+AtomicIntType NumberOfParallelCommands = 0;
+int MaxNumberOfParallelCommands = 8;
+int ParallelCommandError = 0;
 
-ConditionVariable ParallellCommandWait;
-MutexType ParallellCommandMutex;
+ConditionVariable ParallelCommandWait;
+MutexType ParallelCommandMutex;
 
 int TotalInputFiles = 0;
 int TotalOutputFiles = 0;
@@ -173,6 +177,8 @@ void AwakeConditionVariable(ConditionVariable* c) {
 	WakeConditionVariable(c);
 }
 
+#define dupCString _strdup
+
 #else
 typedef __time_t FileTime;
 #define AtomicIncrement(ptr) __sync_add_and_fetch((ptr), 1)
@@ -228,26 +234,32 @@ void AwakeConditionVariable(ConditionVariable* c) {
 	pthread_cond_signal(c);
 }
 
+#define dupCString strdup
+
 #endif
 
-static char* dupCString(const char* text) {
-	size_t len = strlen(text) + 1;
-	char* copy = (char*)malloc(len);
-	if (copy) {
-		memcpy(copy, text, len);
-	}
-	return copy;
-}
-
 int runExternalCommand(strref commandline) {
-	strown<_MAX_PATH> fullCommand(commandline);
-	fullCommand.replace(UNWANTED_FOLDER_SEPARATOR, WANTED_FOLDER_SEPARATOR);
-
-	const int exitCode = system(fullCommand.c_str());
-	if (exitCode != 0) {
-		PrintfW("Command failed with exit code %d (" STRREF_FMT ")\n", exitCode, STRREF_ARG(fullCommand));
+#ifdef _WIN32
+	wchar_t wStr[MAX_COMMAND_LINE_CHARS];
+	int length = MultiByteToWideChar(CP_UTF8, 0, commandline.get(), commandline.get_len(), wStr, MAX_COMMAND_LINE_CHARS);
+	if (length >= 0) { wStr[length<MAX_COMMAND_LINE_CHARS ? length : (MAX_COMMAND_LINE_CHARS-1)] = 0; }
+	for(int index = 0; index < length; ++index) {
+		if (wStr[index] == L'/') { wStr[index] = L'\\'; }
+	}
+	const int exitCode = _wsystem(wStr);
+	if (exitCode != 0 && !IgnoreErrors) {
+		wprintf(L"Command failed with exit code %d (%s)\n", exitCode, wStr);
 		return exitCode;
 	}
+#else
+	strown<MAX_COMMAND_LINE_CHARS> fullCommand(commandline);
+	fullCommand.replace(UNWANTED_FOLDER_SEPARATOR, WANTED_FOLDER_SEPARATOR);
+	const int exitCode = system(fullCommand.c_str());
+	if (exitCode != 0 && !IgnoreErrors) {
+		PrintfW("Command failed with exit code %d (" STRREF_FMT ")\n", exitCode, STRREF_ARG(fullCommand));
+		return exitCode;
+	z}
+#endif
 	return 0;
 }
 
@@ -346,73 +358,73 @@ int registerTool(strref line) {
 	return 1;
 }
 
-ThreadReturn ParallellCommandThread(ThreadArg Arg) {
+ThreadReturn ParallelCommandThread(ThreadArg Arg) {
 	// Run the command
 	const int exitCode = system((const char*)Arg);
 
 	// Output the failure and set the error code if the command failed
-	if (exitCode != 0) {
+	if (exitCode != 0 && !IgnoreErrors) {
 		PrintfW("Command failed with exit code %d (%s)\n", exitCode, (const char*)Arg);
-		LockMutex(&ParallellCommandMutex);
-		ParallellCommandError = exitCode;
-		UnlockMutex(&ParallellCommandMutex);
+		LockMutex(&ParallelCommandMutex);
+		ParallelCommandError = exitCode;
+		UnlockMutex(&ParallelCommandMutex);
 	}
 
-	LockMutex(&ParallellCommandMutex);
-	AtomicDecrement(&NumberOfParallellCommands);
-	AwakeConditionVariable(&ParallellCommandWait);
-	UnlockMutex(&ParallellCommandMutex);
+	LockMutex(&ParallelCommandMutex);
+	AtomicDecrement(&NumberOfParallelCommands);
+	AwakeConditionVariable(&ParallelCommandWait);
+	UnlockMutex(&ParallelCommandMutex);
 	return 0;
 }
 
-bool SyncParallellCommands() {
-	LockMutex(&ParallellCommandMutex);
-	while (NumberOfParallellCommands > 0) {
-		WaitConditionVariable(&ParallellCommandWait, &ParallellCommandMutex);
+bool SyncParallelCommands() {
+	LockMutex(&ParallelCommandMutex);
+	while (NumberOfParallelCommands > 0) {
+		WaitConditionVariable(&ParallelCommandWait, &ParallelCommandMutex);
 	}
-	UnlockMutex(&ParallellCommandMutex);
+	UnlockMutex(&ParallelCommandMutex);
 
 	// Free the command line buffers that are not needed anymore
-	StringBuffer* buffer = pParallellCommandLines;
-	pParallellCommandLines = nullptr;
+	StringBuffer* buffer = pParallelCommandLines;
+	pParallelCommandLines = nullptr;
 	while (buffer) {
 		StringBuffer* next = buffer->next;
 		free(buffer);
 		buffer = next;
 	}
 
-	return ParallellCommandError == 0;
+	return ParallelCommandError == 0;
 }
 
-int RunParallellCommand(strref commandline) {
-	LockMutex(&ParallellCommandMutex);
-	while (NumberOfParallellCommands >= MaxNumberOfParallellCommands) {
-		WaitConditionVariable(&ParallellCommandWait, &ParallellCommandMutex);
+int RunParallelCommand(strref commandline) {
+	LockMutex(&ParallelCommandMutex);
+	while (NumberOfParallelCommands >= MaxNumberOfParallelCommands) {
+		WaitConditionVariable(&ParallelCommandWait, &ParallelCommandMutex);
 	}
 
-	if (ParallellCommandError != 0) {
-		UnlockMutex(&ParallellCommandMutex);
-		PrintfW("Skipping command because a previous command failed with exit code %d\n", ParallellCommandError);
+	if (ParallelCommandError != 0) {
+		UnlockMutex(&ParallelCommandMutex);
+		PrintfW("Skipping command because a previous command failed with exit code %d\n", ParallelCommandError);
 		return 1;
 	}
 
 	// ensure space in the command line string buffer
-	if (pParallellCommandLines == nullptr || pParallellCommandLines->length + commandline.get_len() + 1 >= sizeof(pParallellCommandLines->buffer)) {
+	if (pParallelCommandLines == nullptr || pParallelCommandLines->length + commandline.get_len() + 1 >= sizeof(pParallelCommandLines->buffer)) {
 		StringBuffer* newBuffer = (StringBuffer*)malloc(sizeof(StringBuffer));
 		newBuffer->length = 0;
-		newBuffer->next = pParallellCommandLines;
-		pParallellCommandLines = newBuffer;
+		newBuffer->next = pParallelCommandLines;
+		pParallelCommandLines = newBuffer;
 	}
 
-	char* commandlinePtr = pParallellCommandLines->buffer + pParallellCommandLines->length;
+	char* commandlinePtr = pParallelCommandLines->buffer + pParallelCommandLines->length;
 	memcpy(commandlinePtr, commandline.get(), commandline.get_len());
 	commandlinePtr[commandline.get_len()] = 0;
-	pParallellCommandLines->length += commandline.get_len() + 1;
+	pParallelCommandLines->length += commandline.get_len() + 1;
 
-	AtomicIncrement(&NumberOfParallellCommands);
-	UnlockMutex(&ParallellCommandMutex);
+	AtomicIncrement(&NumberOfParallelCommands);
+	UnlockMutex(&ParallelCommandMutex);
 
-	StartThread(nullptr, 0, ParallellCommandThread, (void*)commandlinePtr, "ParallellCommand");
+	StartThread(nullptr, 0, ParallelCommandThread, (void*)commandlinePtr, "ParallelCommand");
 	return 0;
 }
 
@@ -434,7 +446,7 @@ strovl replaceFileMatch(strovl shared, strref match, strref replace) {
 		strref rep = replace;
 		strl_t match_len = match.get_len();
 		if (pos >= 0) {
-			if (shared[pos + match_len] == '.') {
+			while (shared[pos + match_len] == '.') {
 				strref shared_match = (shared + pos + match_len + 1);
 				if (shared_match.has_prefix(match_filename)) {
 					match_len += match_filename.get_len() + 1;
@@ -459,13 +471,14 @@ strovl replaceFileMatch(strovl shared, strref match, strref replace) {
 					int index = (shared + pos + match_len + 1).atoi();
 					while (index > 1) {
 						rep.split_path();
-						rep.skip_whitespace();
 						--index;
 					}
 					rep = rep.get_path();
 
 					// if the next character is a dot, we can assume it's a file extension and skip it
 					match_len += 1 + (shared + pos + match_len + 1).len_numeric();
+				} else {
+					break;
 				}
 			}
 
@@ -523,27 +536,18 @@ int executeLine(strref line, strref scriptFolder) {
 		pos = pos_next;
 	}
 
-	line = line.before_or_full('#').get_trimmed_ws(); // remove comments
-
 	// params are in, out, args
 	strref params = line.get_trimmed_ws();
-	if (params.get_first() == '(' && params.get_last() == ')') { params.skip(1); params.clip(1); params.trim_whitespace(); }
 
 	// command out : in args
-	strref out = params.next_token(':').get_trimmed_ws(); ++params; params.skip_whitespace();
-	strref in;
-	if (params.get_first()=='(') {
-		int close_param = params.find(')');
-		if (close_param<0) {
-			printf("Expected closing parenthesis\n");
-			return 1;
-		}
-		in = params.get_clipped((strl_t)close_param + 1);
-		params.skip(in.get_len());
-		params.skip_whitespace();
-	} else {
-		in = params.next_token(' ').get_trimmed_ws();
+	strref out = params.get_first() == '(' ? params.split_parens() : params.split_path();
+	if (!params.grab_prefix(':')) {
+		PrintfW("Expected ':' after output file(s) in line: " STRREF_FMT "\n", STRREF_ARG(line));
+		return 1;
 	}
+	params.skip_whitespace();
+	strref in = params.get_first() == '(' ? params.split_parens() : params.split_path();
+
 	strref args = params.get_trimmed_ws();
 
 	in.trim_surrounding_quotes().trim_whitespace();
@@ -566,8 +570,6 @@ int executeLine(strref line, strref scriptFolder) {
 				if (stat_in.st_mtime > newest_in_time || newest_in_time == 0) {
 					newest_in_time = stat_in.st_mtime;
 				}
-			} else {
-				__nop();
 			}
 			++TotalInputFiles;
 		}
@@ -577,7 +579,7 @@ int executeLine(strref line, strref scriptFolder) {
 		newest_in_time = in_exists ? stat_in.st_mtime : 0;
 		++TotalInputFiles;
 	}
-	if (!in_exists && (!Clean || Rebuild)) {
+	if (!in_exists && (!Clean || Rebuild) && !IgnoreErrors) {
 		PrintfW("Input file does not exist: " STRREF_FMT "\n", STRREF_ARG(in));
 		return 1;
 	}
@@ -633,7 +635,7 @@ int executeLine(strref line, strref scriptFolder) {
 
 	for (BathTool& tool : RegisteredTools) {
 		if (name.same_str(tool.name)) {
-			strown<_MAX_PATH> fullCommand(tool.command);
+			strown<MAX_COMMAND_LINE_CHARS> fullCommand(tool.command);
 			fullCommand.append(" ").append(tool.mapping);
 			fullCommand.replace("$Args", args);
 			fullCommand.set_len(replaceFileMatch(fullCommand, "$In", in).get_len());
@@ -656,8 +658,8 @@ int executeLine(strref line, strref scriptFolder) {
 				return 0;
 			}
 
-			if (RunParallell && !ForceSingleThread) {
-				return RunParallellCommand(fullCommand);
+			if (RunParallel && !ForceSingleThread) {
+				return RunParallelCommand(fullCommand);
 			}
 			return runExternalCommand(fullCommand);
 		}
@@ -665,7 +667,7 @@ int executeLine(strref line, strref scriptFolder) {
 	PrintfW("Error: Tool not registered: " STRREF_FMT "\n", STRREF_ARG(name));
 	return 1;
 }
-	
+
 int runBath(const char* scriptFile);
 
 int includeScript(strref line, strref scriptFolder) {
@@ -712,6 +714,7 @@ int runBath(const char* scriptFile) {
 
 	// path from current working folder
 	strref path(strref(scriptFile).before_last_or_full(LINUX_FOLDER_SEPARATOR, WINDOWS_FOLDER_SEPARATOR));
+	path.skip_bom();
 
 	strref scriptRef((const char*)script, (strl_t)scriptSize), file(scriptRef);
 	while (strref line = file.line()) {
@@ -734,23 +737,23 @@ int runBath(const char* scriptFile) {
 				}
 				Status = BathStatus_Execute;
 				continue;
-			} else if (command.same_str("parallel") || command.same_str("parallell")) {
-				RunParallell = true;
+			} else if (command.has_prefix("parallel")) {
+				RunParallel = true;
 				Status = BathStatus_Execute;
 				line.skip_whitespace();
 				if (strref::is_number(line.get_first())) {
-					MaxNumberOfParallellCommands = line.atoi();
-					if (MaxNumberOfParallellCommands < 1) {
-						MaxNumberOfParallellCommands = 1;
+					MaxNumberOfParallelCommands = line.atoi();
+					if (MaxNumberOfParallelCommands < 1) {
+						MaxNumberOfParallelCommands = 1;
 					}
 				}
 				if (Verbose) {
-					PrintfW("Parallellizing\n");
+					PrintfW("Parallelizing\n");
 				}
 				continue;
 			} else if (command.same_str("sequential")) {
-				RunParallell = false;
-				SyncParallellCommands();
+				RunParallel = false;
+				SyncParallelCommands();
 				Status = BathStatus_Execute;
 				if (Verbose) {
 					PrintfW("Sequentializing\n");
@@ -760,14 +763,30 @@ int runBath(const char* scriptFile) {
 				if (Verbose) {
 					PrintfW("Synchronizing\n");
 				}
-				SyncParallellCommands();
+				SyncParallelCommands();
 				continue;
-			} else if (command.same_str("finalize")) {
+			} else if (command.same_str("Raw")) {
+				SyncParallelCommands();
+				Status = BathStatus_RawCommands;
 				if (Verbose) {
-					PrintfW("Finalizing\n");
+					PrintfW("Raw commands\n");
 				}
-				SyncParallellCommands();
-				Status = BathStatus_Finalize;
+				continue;
+			} else if (command.has_prefix("Ignore")) {
+				SyncParallelCommands();
+				command.end_word();
+				command.skip_whitespace();
+				IgnoreErrors = !command.has_prefix("off");
+				if (Verbose) {
+					PrintfW("Ignore errors: %s\n", IgnoreErrors ? "on" : "off");
+				}
+				continue;
+			} else if (command.has_prefix("Error")) {
+				SyncParallelCommands();
+				IgnoreErrors = false;
+				if (Verbose) {
+					PrintfW("Resuming error checking\n");
+				}
 				continue;
 			} else if (command.same_str("include")) {
 				if (Verbose) {
@@ -784,7 +803,7 @@ int runBath(const char* scriptFile) {
 				return 1;
 			case BathStatus_Tools:
 				if (!registerTool(line)) {
-					PrintfW("Stopping at line %d of %s\n", scriptRef.count_lines(line), scriptFile);
+					PrintfW("Stopping at line %d of %s\n", scriptRef.count_lines(line)+1, scriptFile);
 					return 1;
 				}
 				break;
@@ -792,14 +811,14 @@ int runBath(const char* scriptFile) {
 			{
 				int errorCode = executeLine(line, path);
 				if (errorCode != 0) {
-					PrintfW("Failed execution at line %d of %s with error code %d\n", scriptRef.count_lines(line), scriptFile, errorCode);
+					PrintfW("Failed execution at line %d of %s with error code %d\n", scriptRef.count_lines(line)+1, scriptFile, errorCode);
 					return 1;
 				}
 				break;
 			}
-			case BathStatus_Finalize:
+			case BathStatus_RawCommands:
 				if (runExternalCommand(line) != 0) {
-					PrintfW("Finalize command failed at line %d of %s\n", scriptRef.count_lines(line), scriptFile);
+					PrintfW("Finalize command failed at line %d of %s\n", scriptRef.count_lines(line)+1, scriptFile);
 					return 1;
 				}
 				break;
@@ -837,7 +856,9 @@ int main(int argc, char** argv) {
 			else if (arg.same_str("clear")) { Clean = true; }
 			else if (arg.same_str("rebuild")) { Rebuild = true; }
 			else if (arg.same_str("verbose")) { Verbose = true; }
+			else if (arg.same_str("stats")) { ShowStats = true; }
 			else if (arg.same_str("echo_off")) { ShowCommands = false; }
+			else if (arg.same_str("show_commands")) { ShowCommands = true; Rebuild = true; IgnoreErrors = true; Verbose = false; ForceSingleThread = true; RunCommands = false; }
 			else {
 				PrintfW("Error: Unknown argument: %s\n", arg.get());
 				scriptFile = nullptr;
@@ -866,17 +887,17 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
-	InitMutex(&ParallellCommandMutex);
-	InitConditionVariable(&ParallellCommandWait);
+	InitMutex(&ParallelCommandMutex);
+	InitConditionVariable(&ParallelCommandWait);
 
 	int errorCode = runBath(scriptFile);
 
 	// Wait for all parallel commands to finish before exiting
-	SyncParallellCommands();
+	SyncParallelCommands();
 
 	// Shut down systems
-	DestroyConditionVariable(&ParallellCommandWait);
-	DestroyMutex(&ParallellCommandMutex);
+	DestroyConditionVariable(&ParallelCommandWait);
+	DestroyMutex(&ParallelCommandMutex);
 
 	for (char* loadedFile : LoadedFiles) {
 		free(loadedFile);
@@ -887,7 +908,7 @@ int main(int argc, char** argv) {
 	}
 	IncludedScriptFiles.clear();
 
-	if (Verbose) {
+	if (Verbose || ShowStats) {
 		double endTime = GetMonotonicSeconds();
 		PrintfW("Total execution time: %.9f seconds\n", endTime - startTime);
 		PrintfW("Total input files: %d\n", TotalInputFiles);
