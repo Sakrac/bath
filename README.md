@@ -50,6 +50,15 @@ Directives ignore case so feel free to use any casing you are comfortable with, 
 
 A cautionary note on parallelization: Make sure you don't use the result of a file in the same parallelize block, such as assembling a binary file that is included in another assembly source! This is my own first mistake using the tool.
 
+## What is not supported
+
+* ms-dos / bash commands like cd, for, echo, del, mkdir etc.
+
+Depending on if I can figure out good use cases it is no problem to add relevant features as needed, such features may include:
+
+* Implicit $Out, where $Out is evaluated from what is in $In
+* Iterate over files of a type (extension or pattern matching) in a older for a tool
+
 ## Tool declaration
 
 A tool declaration looks like this:
@@ -72,9 +81,15 @@ It is often useful to reference only a filename or path component. Bath provides
 
 - `$In.filename` - filename only, no path and no extension
 - `$In.noext` - path without the extension
+- `$In.noext_all` - all paths without the extension
 - `$In.path` - path without a trailing slash
 - `$In.1` - first file in a multi-file list
 - `$In.<number>` - indexed file in a multi-file list
+
+Filters can be combined as needed:
+
+- `$In.2.noext` - insertes the second input file's path
+- `$In.3.filename` - insertes the third input filename excluing path and extension
 
 The same filters are available for `$Out`.
 

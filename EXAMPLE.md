@@ -2,6 +2,8 @@
 
 This is bath file converted from two separate .bat files to build the Commodore 64 demo [Rebels 1989](https://csdb.dk/release/?id=182349). The first is convert.bat that converts images etc. to usable data and the second is make.bat that runs an assembler on source code to create a single .prg file for the demo.
 
+The demo can be emulated in a browser for reference to the images: [Floooh tiny8bit emulators: Rebels 1989)](https://floooh.github.io/tiny8bit/c64.html?file=c64/rebels1989_c64.prg)
+
 Running each command in sequence takes 4 seconds, running with parallel commands brings that down to 1.2 seconds for a full rebuild. Just checking the timestamps when no change is done brings the time down to 160 milliseconds!
 
 Imagine the iteration possibilities of this 25x build time speedup :)
