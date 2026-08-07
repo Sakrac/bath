@@ -823,6 +823,14 @@ int runBath(const char* scriptFile) {
 				break;
 			}
 			case BathStatus_RawCommands:
+				if (ShowCommands || Verbose) {
+					PrintfW(STRREF_FMT "\n", STRREF_ARG(line));
+				}
+
+				if (!RunCommands || (Clean && !Rebuild)) {
+					break;
+				}
+
 				if (runExternalCommand(line) != 0) {
 					PrintfW("Finalize command failed at line %d of %s\n", scriptRef.count_lines(line)+1, scriptFile);
 					return 1;
