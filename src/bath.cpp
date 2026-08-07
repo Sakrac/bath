@@ -674,7 +674,11 @@ int includeScript(strref line, strref scriptFolder) {
 	strref includePath = line.get_trimmed_ws();
 	strown<_MAX_PATH> fullIncludePath;
 
-	if ((includePath.get_len() > 1 && (includePath.has_prefix("/") || includePath.has_prefix("\\"))) || (includePath.get_len() >= 2 && includePath[1] == ':')) {
+	if (!scriptFolder.valid()) {
+		fullIncludePath.copy(includePath);
+	} else if ((includePath.get_len() > 1 &&
+		(includePath.has_prefix("/") || includePath.has_prefix("\\"))) ||
+		(includePath.get_len() >= 2 && includePath[1] == ':')) {
 		fullIncludePath.copy(includePath);
 	} else {
 		fullIncludePath.copy(scriptFolder);
@@ -713,10 +717,10 @@ int runBath(const char* scriptFile) {
 	BathStatus Status = BathStatus_Unset;
 
 	// path from current working folder
-	strref path(strref(scriptFile).before_last_or_full(LINUX_FOLDER_SEPARATOR, WINDOWS_FOLDER_SEPARATOR));
-	path.skip_bom();
+	strref path(strref(scriptFile).before_last(LINUX_FOLDER_SEPARATOR, WINDOWS_FOLDER_SEPARATOR));
 
 	strref scriptRef((const char*)script, (strl_t)scriptSize), file(scriptRef);
+	scriptRef.skip_bom();
 	while (strref line = file.line()) {
 		line.trim_whitespace();
 		if (!line.valid() || line.get_first() == '#' || line.has_prefix("---")) {
@@ -792,7 +796,9 @@ int runBath(const char* scriptFile) {
 				if (Verbose) {
 					PrintfW("Including script " STRREF_FMT "\n", STRREF_ARG(line));
 				}
-				includeScript(line, path);
+				if (includeScript(line, path)) {
+					return 1;
+				}
 				continue;
 			}
 			continue;
