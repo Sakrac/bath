@@ -8,6 +8,8 @@ Running each command in sequence takes 4 seconds, running with parallel commands
 
 Imagine the iteration possibilities of this 25x build time speedup :)
 
+![Rebels 1989](rebels1989.png)
+
 ## How to read this example
 
 First the tools are declared. Multiple tool aliases are created for the same executable to make it easier to build data from specific assets.
