@@ -19,6 +19,20 @@ I will keep experimenting to make the process more intuitive as I convert my own
 
 Note that unicode files are *fully supported* and the .bath files are expected to be saved as utf-8 with or without BOM. There are test files with Japanese paths to test this but if anything unexpected happens just file an issue in github.
 
+## Highlights
+
+* Skips commands if output is newer than input
+* Parallelized processing when desired
+* Sync points when outputs must finish before continuing
+* Full unicode support for files and script
+* Missing output folders are created as needed
+* Input files are validated before running any command
+* Change directory / make directory commands
+* Sets the current directory to the .bath file path, restores on exit.
+* Stops on error
+* Clean / Rebuild if file dates are off or tools change
+* Can execute regular command lines in raw mode
+
 ## Example
 
 I converted the build files for a commodore 64 demo I made in 2019 to show a "working" example (it works on my computer). When changing a single assembly source this enables a 25x build time speedup.
@@ -45,6 +59,8 @@ The current implementation recognizes these directives:
 - `$Raw` regular command lines follow, always runs. Useful while porting a .bat or .sh file to a full .bath file
 - `$Ignore` or `$IgnoreErrors` keeps running even if errors are enoountered including if input files are missing. `$Ignore off` will re-enable error checking.
 - `$Error` enables error checking if disabled with a `$Ignore`
+- '$ChangeDir` change directory to argument
+- '$MakeDir` create a directory
 
 Directives ignore case so feel free to use any casing you are comfortable with, including uppercase spellings such as $TOOLS or $PARALLELL.
 

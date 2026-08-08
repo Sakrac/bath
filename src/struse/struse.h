@@ -700,6 +700,13 @@ public:
 		return *this;
 	}
 
+	strref get_trimmed_quotes() const {
+		if (get_len() >= 2 && get_first() == '"' && get_last() == '"') {
+			return strref(string + 1, length - 2);
+		}
+		return *this;
+	}
+
 	strref trim_surrounding_parens() {
 		if (get_first() == '(' && get_last() == ')') {
 			string++;

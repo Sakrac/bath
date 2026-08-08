@@ -10,6 +10,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <direct.h>
+#include <shlobj_core.h>
 #else
 #include <unistd.h>
 #include <sys/wait.h>
@@ -88,6 +89,13 @@ std::vector<char*> IncludedScriptFiles;
 std::vector<BathTool> RegisteredTools;
 std::vector<char*> LoadedFiles;
 
+typedef struct BathPath {
+	strref path;
+	std::vector<BathPath> subPaths;
+} BathPath;
+
+std::vector<BathPath> EncounteredOutputPaths;
+
 AtomicIntType NumberOfParallelCommands = 0;
 int MaxNumberOfParallelCommands = 8;
 int ParallelCommandError = 0;
@@ -97,6 +105,8 @@ MutexType ParallelCommandMutex;
 
 int TotalInputFiles = 0;
 int TotalOutputFiles = 0;
+int ExecutedCommands = 0;
+int TotalCommands = 0;
 
 static const strref match_filename = "filename";
 static const strref match_noext = "noext";
@@ -105,16 +115,17 @@ static const strref match_path = "path";
 
 #ifdef _WIN32
 typedef time_t FileTime;
+typedef struct _stat FileStat;
 #define AtomicIncrement(ptr) InterlockedIncrement((volatile LONG*)(ptr))
 #define AtomicDecrement(ptr) InterlockedDecrement((volatile LONG*)(ptr))
 
-void PrintfW(const char *format, ...) {
+void PrintfW(const char* format, ...) {
 	va_list args;
 	va_start(args, format);
 	char buffer[4096];
 	vsnprintf(buffer, sizeof(buffer), format, args);
 	va_end(args);
-    wchar_t wStr[4096];
+	wchar_t wStr[4096];
 	MultiByteToWideChar(CP_UTF8, 0, buffer, -1, wStr, sizeof(wStr) / sizeof(wStr[0]));
 	wprintf(L"%s", wStr);
 }
@@ -177,10 +188,71 @@ void AwakeConditionVariable(ConditionVariable* c) {
 	WakeConditionVariable(c);
 }
 
+int GetFileStat(strref file, FileStat* outStat) {
+	file.trim_surrounding_quotes();
+	wchar_t wStr[_MAX_PATH];
+	int length = MultiByteToWideChar(CP_UTF8, 0, file.get(), file.get_len(), wStr, sizeof(wStr) / sizeof(wStr[0]));
+	if (length < 0 || length >= (_MAX_PATH - 1)) { return 1; }
+	for (int index = 0; index < length; ++index) {
+		if (wStr[index] == L'/') { wStr[index] = L'\\'; }
+	}
+	wStr[length] = 0;
+	return _wstat(wStr, outStat);
+}
+
+int ChangePath(strref path) {
+	path.trim_surrounding_quotes();
+	wchar_t wFolder[_MAX_PATH];
+	int len = MultiByteToWideChar(CP_UTF8, 0, path.get(), path.get_len(), wFolder, _MAX_PATH);
+	wFolder[len] = 0;
+	for (int index = 0; index < len; ++index) {
+		if (wFolder[index] == L'/') { wFolder[index] = L'\\'; }
+	}
+	if (len < _MAX_PATH) {
+		DWORD dwAttrib = GetFileAttributesW(wFolder);
+		if (dwAttrib == INVALID_FILE_ATTRIBUTES || !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
+			return 1;
+		}
+		SetCurrentDirectoryW(wFolder);
+		if (Verbose) {
+			PrintfW("Changed directory to: " STRREF_FMT "\n", STRREF_ARG(path));
+		}
+	}
+	return 0;
+}
+
+int MakePathIfNotExists(strref path) {
+	path.trim_surrounding_quotes();
+	wchar_t wFolder[_MAX_PATH];
+	GetCurrentDirectoryW(_MAX_PATH, wFolder);
+	int offs = (int)wcslen(wFolder);
+	wFolder[offs++] = L'\\';
+
+	int length = offs + MultiByteToWideChar(CP_UTF8, 0, path.get(), path.get_len(), wFolder + offs, sizeof(wFolder) / sizeof(wFolder[0]) - offs);
+	if (length < 0 || length == _MAX_PATH) { return 1; }
+	for (int index = offs; index < length; ++index) {
+		if (wFolder[index] == L'/') { wFolder[index] = L'\\'; }
+	}
+	wFolder[length] = 0;
+	DWORD dwAttrib = GetFileAttributesW(wFolder);
+	if (dwAttrib == INVALID_FILE_ATTRIBUTES || !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
+		int error_code = SHCreateDirectoryExW(0, wFolder, 0);
+		if (error_code != ERROR_SUCCESS) {
+			PrintfW("Error: Failed to create directory: " STRREF_FMT " (error code %d)\n", STRREF_ARG(path), error_code);
+			return error_code;
+		} else if (Verbose) {
+			PrintfW("Created directory: " STRREF_FMT "\n", STRREF_ARG(path));
+		}
+	}
+	return 0;
+}
+
 #define dupCString _strdup
 
 #else
+
 typedef __time_t FileTime;
+typedef struct stat FileStat;
 #define AtomicIncrement(ptr) __sync_add_and_fetch((ptr), 1)
 #define AtomicDecrement(ptr) __sync_sub_and_fetch((ptr), 1)
 #define PrintfW printf
@@ -234,6 +306,42 @@ void AwakeConditionVariable(ConditionVariable* c) {
 	pthread_cond_signal(c);
 }
 
+int GetFileStat(strref file, FileStat* outStat) {
+	file.trim_surrounding_quotes();
+	return stat(strown<_MAX_PATH>(file.get_trimmed_quotes()).replace(UNWANTED_FOLDER_SEPARATOR, WANTED_FOLDER_SEPARATOR).c_str(), outStat);
+}
+
+int ChangePath(strref path) {
+	path.trim_surrounding_quotes();
+	struct stat statbuf;
+	strown<_MAX_PATH> path_own(path);
+	if (stat(path_own.c_str(), &statbuf) != 0) {
+		return 1;
+	}
+	if (!(info.st_mode & S_IFDIR)) {
+		return 1;
+	}
+	// Change the current working directory to the script's folder, and remove the path from the script file
+	chdir(strown<_MAX_PATH>(path).c_str());
+	if (Verbose) {
+		PrintfW("Changed directory to: " STRREF_FMT "\n", STRREF_ARG(path));
+	}
+	return 0;
+}
+
+int MakePathIfNotExists(strref path) {
+	path.trim_surrounding_quotes();
+	struct stat statbuf;
+	strown<_MAX_PATH> path_own(path);
+	if (stat(path_own.c_str(), &statbuf) != 0) {
+		mkdir(path_own.c_str(), 0755);
+		if (Verbose) {
+			PrintfW("Created directory: " STRREF_FMT "\n", STRREF_ARG(path));
+		}
+	}
+	return 0;
+}
+
 #define dupCString strdup
 
 #endif
@@ -242,8 +350,8 @@ int runExternalCommand(strref commandline) {
 #ifdef _WIN32
 	wchar_t wStr[MAX_COMMAND_LINE_CHARS];
 	int length = MultiByteToWideChar(CP_UTF8, 0, commandline.get(), commandline.get_len(), wStr, MAX_COMMAND_LINE_CHARS);
-	if (length >= 0) { wStr[length<MAX_COMMAND_LINE_CHARS ? length : (MAX_COMMAND_LINE_CHARS-1)] = 0; }
-	for(int index = 0; index < length; ++index) {
+	if (length >= 0) { wStr[length < MAX_COMMAND_LINE_CHARS ? length : (MAX_COMMAND_LINE_CHARS - 1)] = 0; }
+	for (int index = 0; index < length; ++index) {
 		if (wStr[index] == L'/') { wStr[index] = L'\\'; }
 	}
 	const int exitCode = _wsystem(wStr);
@@ -258,7 +366,7 @@ int runExternalCommand(strref commandline) {
 	if (exitCode != 0 && !IgnoreErrors) {
 		PrintfW("Command failed with exit code %d (" STRREF_FMT ")\n", exitCode, STRREF_ARG(fullCommand));
 		return exitCode;
-	z}
+	}
 #endif
 	return 0;
 }
@@ -270,9 +378,9 @@ uint8_t* LoadFile(const char* path, size_t* outSize) {
 		long size = ftell(file);
 		fseek(file, 0, SEEK_SET);
 		if (size < 0) {
-            if (Verbose) {
-                PrintfW("Failed to get file size for: %s\n", path);
-            }
+			if (Verbose) {
+				PrintfW("Failed to get file size for: %s\n", path);
+			}
 			fclose(file);
 			return nullptr;
 		}
@@ -281,9 +389,9 @@ uint8_t* LoadFile(const char* path, size_t* outSize) {
 		if (buffer) {
 			size_t bytesRead = fread(buffer, 1, size_t(size), file);
 			if (bytesRead != size_t(size)) {
-                if (Verbose) {
-                    PrintfW("Failed to read file data: %s\n", path);
-                }
+				if (Verbose) {
+					PrintfW("Failed to read file data: %s\n", path);
+				}
 				fclose(file);
 				free(buffer);
 				return nullptr;
@@ -293,17 +401,61 @@ uint8_t* LoadFile(const char* path, size_t* outSize) {
 			}
 			fclose(file);
 			return buffer;
-        } else if (Verbose) {
-            PrintfW("Failed to alloc buffer for: %s\n", path);
-        }
+		} else if (Verbose) {
+			PrintfW("Failed to alloc buffer for: %s\n", path);
+		}
 		fclose(file);
 	}
-    
-    if (Verbose) {
-        PrintfW("Could not open file errno %d: %s\n", errno, path);
-    }
+
+	if (Verbose) {
+		PrintfW("Could not open file errno %d: %s\n", errno, path);
+	}
 
 	return nullptr;
+}
+
+int ValidateOrCreateOutputPath(strref file) {
+	// check if already encountered
+	file.trim_surrounding_quotes();
+	std::vector<BathPath>* currentPaths = &EncounteredOutputPaths;
+	strref splits = file;
+	bool found = true;	// if no path to the file then it is valid
+	for (;;) {
+		int splitPath = splits.find(UNWANTED_FOLDER_SEPARATOR, WANTED_FOLDER_SEPARATOR);
+		if (splitPath < 0) { break; }
+		strref subPath(splits.get(), splitPath);
+		found = false;
+		for (BathPath& path : *currentPaths) {
+#ifdef _WIN32
+			if (path.path.same_str(subPath)) {
+#else
+			if (path.path.same_str_case(subPath)) {
+#endif
+				currentPaths = &path.subPaths;
+				found = true;
+				break;
+			}
+		}
+		if (!found) { break; }
+		splits += splitPath + 1;
+	}
+	if (found) { return 0; }
+
+// create the path if it does not exist
+// splitPath is the first folder that needs to be created, and recorded into currentPaths
+// file is the full path from the current folder, splits is the first path to check or create
+
+	for (;;) {
+		int pathPart = splits.find(UNWANTED_FOLDER_SEPARATOR, WANTED_FOLDER_SEPARATOR);
+		if (pathPart < 0) { break; }
+		strref folderToCreate = file.get_clipped((strl_t)(splits.get() - file.get() + pathPart));
+		BathPath newPath = { splits.get_clipped(pathPart), {} };
+		currentPaths->push_back(newPath);
+		currentPaths = &currentPaths->back().subPaths;
+		splits += pathPart + 1;
+		return MakePathIfNotExists(folderToCreate);
+	}
+	return 0;
 }
 
 int registerTool(strref line) {
@@ -340,7 +492,7 @@ int registerTool(strref line) {
 	BathTool tool = { name, command, mapping };
 
 	// check if the same tool is already registered but with different command or mapping
-	for(BathTool& existingTool : RegisteredTools) {
+	for (BathTool& existingTool : RegisteredTools) {
 		if (existingTool.name.same_str(tool.name)) {
 			if (!command.same_str(existingTool.command) || !mapping.same_str(existingTool.mapping)) {
 				PrintfW("Error: Tool already registered with different command or mapping: " STRREF_FMT "\n", STRREF_ARG(name));
@@ -455,7 +607,7 @@ strovl replaceFileMatch(strovl shared, strref match, strref replace) {
 				} else if (shared_match.has_prefix(match_noext_all)) {
 					match_len += match_noext_all.get_len() + 1;
 					workspace.clear();
-					while(strref file = rep.split_path()) {
+					while (strref file = rep.split_path()) {
 						workspace.append(file.before_last('.')).append(' ');
 					}
 					rep = workspace.get_strref();
@@ -465,7 +617,7 @@ strovl replaceFileMatch(strovl shared, strref match, strref replace) {
 					rep = rep.before_last_or_full('.');
 				} else if (shared_match.has_prefix(match_path)) {
 					match_len += match_path.get_len() + 1;
-					rep = rep.before_last_or_full(LINUX_FOLDER_SEPARATOR, WINDOWS_FOLDER_SEPARATOR	);
+					rep = rep.before_last_or_full(LINUX_FOLDER_SEPARATOR, WINDOWS_FOLDER_SEPARATOR);
 				} else if (strref::is_number(shared[pos + match_len + 1])) {
 					rep = all_files;
 					int index = (shared + pos + match_len + 1).atoi();
@@ -491,26 +643,24 @@ strovl replaceFileMatch(strovl shared, strref match, strref replace) {
 }
 
 bool cleanFile(strref file) {
+	strref file_no_quotes = file.get_trimmed_quotes();
 #ifdef _WIN32
 	// Note: since file is not zero terminated apply zero termination after converting to wide char
 	wchar_t wStr[_MAX_PATH];
-	int length = MultiByteToWideChar(CP_UTF8, 0, file.get(), file.get_len(), wStr, sizeof(wStr) / sizeof(wStr[0]));
-	if(length >= 0 ) { wStr[length] = 0; }
-    if (length > 0 && DeleteFileW(wStr) != 0) {
+	int length = MultiByteToWideChar(CP_UTF8, 0, file_no_quotes.get(), file_no_quotes.get_len(), wStr, sizeof(wStr) / sizeof(wStr[0]));
+	if (length >= 0) { wStr[length] = 0; }
+	if (length > 0 && DeleteFileW(wStr) != 0) {
 #else
-    if(	remove(strown<_MAX_PATH>(file).c_str()) == 0 ) {
+	if (remove(strown<_MAX_PATH>(file_no_quotes).c_str()) == 0) {
 #endif
-        if (Verbose) {
-            PrintfW("Removed output file: " STRREF_FMT "\n", STRREF_ARG(file));
-        }
-        return true;
-    }
-    return false;
+		if (Verbose) {
+			PrintfW("Removed output file: " STRREF_FMT "\n", STRREF_ARG(file));
+		}
+		return true;
+	}
+	return false;
 }
 
-int GetFileStat(strref file, struct stat* outStat) {
-	return stat(strown<_MAX_PATH>(file).replace(UNWANTED_FOLDER_SEPARATOR, WANTED_FOLDER_SEPARATOR).c_str(), outStat);
-}
 
 int executeLine(strref line, strref scriptFolder) {
 	strref name = line.split_lang();
@@ -520,16 +670,16 @@ int executeLine(strref line, strref scriptFolder) {
 
 	// # is a comment except in quotes!
 	strl_t pos = 0;
-	while(pos < line.get_len()) {
+	while (pos < line.get_len()) {
 		strl_t pos_next = line.get_len(), block_end = pos_next;
 		int q = line.find('"', pos);
-		if (q>=0) {
+		if (q >= 0) {
 			strref quote = (line + q).get_quote_xml();	// returns string within quotes excluding the quotes so we need to add 2 to the length to get the full quote
 			block_end = (strl_t)q;
 			pos_next = block_end + quote.get_len() + 2;
 		}
 		int h = strref(line.get(), block_end).find('#', pos);
-		if(h >=0 ) {
+		if (h >= 0) {
 			line.clip(h);
 			break;
 		}
@@ -550,16 +700,14 @@ int executeLine(strref line, strref scriptFolder) {
 
 	strref args = params.get_trimmed_ws();
 
-	in.trim_surrounding_quotes().trim_whitespace();
-	out.trim_surrounding_quotes().trim_whitespace();
-
-	struct stat stat_in = {}, stat_out = {};
-
+	FileStat stat_in = {}, stat_out = {};
 	FileTime newest_in_time = 0;
 	FileTime oldest_out_time = 0;
 
-    bool in_exists = false;
+	bool in_exists = false;
 	bool out_exists = false;
+
+	TotalCommands++;
 
 	if (in.get_first() == '(' && in.get_last() == ')') {
 		strref all_in = in.trim_surrounding_parens().get_trimmed_ws();
@@ -587,8 +735,12 @@ int executeLine(strref line, strref scriptFolder) {
 	if (out.get_first() == '(' && out.get_last() == ')') {
 		strref all_out = out.trim_surrounding_parens().get_trimmed_ws();
 		while (strref out_multi = all_out.split_path()) {
+			if (ValidateOrCreateOutputPath(out_multi)) {
+				PrintfW("Error: Failed to create output path for: " STRREF_FMT "\n", STRREF_ARG(out_multi));
+				return 1;
+			}
 			if (Clean) {
-                cleanFile(out_multi);
+				cleanFile(out_multi);
 			} else {
 				int stat_out_result = GetFileStat(out_multi, &stat_out);
 				if (stat_out_result == 0) {
@@ -600,10 +752,15 @@ int executeLine(strref line, strref scriptFolder) {
 			}
 			++TotalOutputFiles;
 		}
-	} else if (Clean) {
-        cleanFile(out);
-		++TotalOutputFiles;
 	} else {
+		if (ValidateOrCreateOutputPath(out)) {
+			PrintfW("Error: Failed to create output path for: " STRREF_FMT "\n", STRREF_ARG(out));
+			return 1;
+		}
+		if (Clean) {
+			cleanFile(out);
+			++TotalOutputFiles;
+		}
 		int stat_out_result = GetFileStat(out, &stat_out);
 		out_exists = (stat_out_result == 0);
 		oldest_out_time = out_exists ? stat_out.st_mtime : 0;
@@ -658,6 +815,7 @@ int executeLine(strref line, strref scriptFolder) {
 				return 0;
 			}
 
+			ExecutedCommands++;
 			if (RunParallel && !ForceSingleThread) {
 				return RunParallelCommand(fullCommand);
 			}
@@ -792,6 +950,22 @@ int runBath(const char* scriptFile) {
 					PrintfW("Resuming error checking\n");
 				}
 				continue;
+			} else if (command.same_str("makedir")) {
+				if (Verbose) {
+					PrintfW("Creating directory " STRREF_FMT "\n", STRREF_ARG(line));
+				}
+				if (MakePathIfNotExists(line)) {
+					return 1;
+				}
+				continue;
+			} else if (command.same_str("changedir")) {
+				if (Verbose) {
+					PrintfW("Changing directory " STRREF_FMT "\n", STRREF_ARG(line));
+				}
+				if (ChangePath(line)) {
+					return 1;
+				}
+				continue;
 			} else if (command.same_str("include")) {
 				if (Verbose) {
 					PrintfW("Including script " STRREF_FMT "\n", STRREF_ARG(line));
@@ -809,7 +983,7 @@ int runBath(const char* scriptFile) {
 				return 1;
 			case BathStatus_Tools:
 				if (!registerTool(line)) {
-					PrintfW("Stopping at line %d of %s\n", scriptRef.count_lines(line)+1, scriptFile);
+					PrintfW("Stopping at line %d of %s\n", scriptRef.count_lines(line) + 1, scriptFile);
 					return 1;
 				}
 				break;
@@ -817,12 +991,13 @@ int runBath(const char* scriptFile) {
 			{
 				int errorCode = executeLine(line, path);
 				if (errorCode != 0) {
-					PrintfW("Failed execution at line %d of %s with error code %d\n", scriptRef.count_lines(line)+1, scriptFile, errorCode);
+					PrintfW("Failed execution at line %d of %s with error code %d\n", scriptRef.count_lines(line) + 1, scriptFile, errorCode);
 					return 1;
 				}
 				break;
 			}
 			case BathStatus_RawCommands:
+				TotalCommands++;
 				if (ShowCommands || Verbose) {
 					PrintfW(STRREF_FMT "\n", STRREF_ARG(line));
 				}
@@ -830,9 +1005,9 @@ int runBath(const char* scriptFile) {
 				if (!RunCommands || (Clean && !Rebuild)) {
 					break;
 				}
-
+				ExecutedCommands++;
 				if (runExternalCommand(line) != 0) {
-					PrintfW("Finalize command failed at line %d of %s\n", scriptRef.count_lines(line)+1, scriptFile);
+					PrintfW("Finalize command failed at line %d of %s\n", scriptRef.count_lines(line) + 1, scriptFile);
 					return 1;
 				}
 				break;
@@ -852,28 +1027,16 @@ int main(int argc, char** argv) {
 
 	double startTime = GetMonotonicSeconds();
 
-	// comamnd line options
+	// command line options
 	for (int i = 1; i < argc; ++i) {
 #ifdef _WIN32
 		char tmp[1024];
-		strref arg(tmp, (strl_t)WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, tmp, sizeof(tmp), NULL, NULL)-1);
+		strref arg(tmp, (strl_t)WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, tmp, sizeof(tmp), NULL, NULL) - 1);
 #else
 		strref arg(argv[i]);
 #endif
 		if (arg.grab_prefix("-")) {
-			if (arg.same_str("nocommands")) { RunCommands = false; ShowCommands = true; }
-			else if (arg.same_str("commands")) { RunCommands = true; }
-			else if (arg.same_str("simulate")) { RunCommands = false; }
-			else if (arg.same_str("force-single-thread")) { ForceSingleThread = true; }
-			else if (arg.same_str("single")) { ForceSingleThread = true; }
-			else if (arg.same_str("clean")) { Clean = true; }
-			else if (arg.same_str("clear")) { Clean = true; }
-			else if (arg.same_str("rebuild")) { Rebuild = true; }
-			else if (arg.same_str("verbose")) { Verbose = true; }
-			else if (arg.same_str("stats")) { ShowStats = true; }
-			else if (arg.same_str("echo_off")) { ShowCommands = false; }
-			else if (arg.same_str("show_commands")) { ShowCommands = true; Rebuild = true; IgnoreErrors = true; Verbose = false; ForceSingleThread = true; RunCommands = false; }
-			else {
+			if (arg.same_str("nocommands")) { RunCommands = false; ShowCommands = true; } else if (arg.same_str("commands")) { RunCommands = true; } else if (arg.same_str("simulate")) { RunCommands = false; } else if (arg.same_str("force-single-thread")) { ForceSingleThread = true; } else if (arg.same_str("single")) { ForceSingleThread = true; } else if (arg.same_str("clean")) { Clean = true; } else if (arg.same_str("clear")) { Clean = true; } else if (arg.same_str("rebuild")) { Rebuild = true; } else if (arg.same_str("verbose")) { Verbose = true; } else if (arg.same_str("stats")) { ShowStats = true; } else if (arg.same_str("echo_off")) { ShowCommands = false; } else if (arg.same_str("show_commands")) { ShowCommands = true; Rebuild = true; IgnoreErrors = true; Verbose = false; ForceSingleThread = true; RunCommands = false; } else {
 				PrintfW("Error: Unknown argument: %s\n", arg.get());
 				scriptFile = nullptr;
 				sawScript = true;
@@ -901,6 +1064,26 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
+	// Save the original working directory so we can restore it later, set the current working directory to the script's folder, and remove the path from the script file
+	char* originalFolder = nullptr;
+#ifdef _WIN32
+	{
+		wchar_t wFolder[_MAX_PATH];
+		GetCurrentDirectoryW(_MAX_PATH, wFolder);
+		int pathLength = WideCharToMultiByte(CP_UTF8, 0, wFolder, -1, NULL, 0, NULL, NULL);
+		originalFolder = (char*)malloc(pathLength + 1);
+		WideCharToMultiByte(CP_UTF8, 0, wFolder, -1, originalFolder, pathLength, NULL, NULL);
+	}
+#else
+	originalFolder = getcwd(nullptr, 0);
+#endif
+	strref scriptPath = strref(scriptFile).get_trimmed_ws().before_last(LINUX_FOLDER_SEPARATOR, WINDOWS_FOLDER_SEPARATOR);
+	if (scriptPath.valid()) {
+		// Change the current working directory to the script's folder, and remove the path from the script file
+		scriptFile += scriptPath.get_len() + 1;
+		ChangePath(scriptPath);
+	}
+
 	InitMutex(&ParallelCommandMutex);
 	InitConditionVariable(&ParallelCommandWait);
 
@@ -925,9 +1108,24 @@ int main(int argc, char** argv) {
 	if (Verbose || ShowStats) {
 		double endTime = GetMonotonicSeconds();
 		PrintfW("Total execution time: %.9f seconds\n", endTime - startTime);
+		PrintfW("Commands Executed: %d / %d\n", ExecutedCommands, TotalCommands);
 		PrintfW("Total input files: %d\n", TotalInputFiles);
 		PrintfW("Total output files: %d\n", TotalOutputFiles);
 	}
+
+	// Restore the original working directory
+#ifdef _WIN32
+	{
+		wchar_t wFolder[_MAX_PATH];
+		MultiByteToWideChar(CP_UTF8, 0, originalFolder, -1, wFolder, _MAX_PATH);
+		SetCurrentDirectoryW(wFolder);
+	}
+#else
+	chdir(originalFolder);
+#endif
+	free(originalFolder);
+
+
 
 	return errorCode;
 }
