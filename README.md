@@ -59,8 +59,8 @@ The current implementation recognizes these directives:
 - `$Raw` regular command lines follow, always runs. Useful while porting a .bat or .sh file to a full .bath file
 - `$Ignore` or `$IgnoreErrors` keeps running even if errors are enoountered including if input files are missing. `$Ignore off` will re-enable error checking.
 - `$Error` enables error checking if disabled with a `$Ignore`
-- '$ChangeDir` change directory to argument
-- '$MakeDir` create a directory
+- `$ChangeDir` change directory to argument
+- `$MakeDir` create a directory
 
 Directives ignore case so feel free to use any casing you are comfortable with, including uppercase spellings such as $TOOLS or $PARALLELL.
 
