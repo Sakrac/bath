@@ -102,6 +102,7 @@ int ParallelCommandError = 0;
 
 ConditionVariable ParallelCommandWait;
 MutexType ParallelCommandMutex;
+MutexType ValidatePathMutex;
 
 int TotalInputFiles = 0;
 int TotalOutputFiles = 0;
@@ -153,7 +154,9 @@ void StartThread(ThreadType* thread, size_t stack, ThreadFunction func, void* ar
 	ThreadType newThread = CreateThread(NULL, stack, func, arg, 0, NULL);
 	if (thread) {
 		*thread = newThread;
+		return 0;
 	}
+	retirm 1;
 }
 
 void InitMutex(MutexType* m) {
@@ -265,11 +268,24 @@ double GetMonotonicSeconds() {
 	return static_cast<double>(timeValue.tv_sec) + static_cast<double>(timeValue.tv_nsec) / 1000000000.0;
 }
 
-void StartThread(ThreadType* thread, size_t stack, ThreadFunction func, void* arg, const char* name) {
-	ThreadType newThread = pthread_create(thread, 0, func, arg);
+int StartThread(ThreadType* thread, size_t stack, ThreadFunction func, void* arg, const char* name) {
+	(void)stack;
+	(void)name;
+
+	pthread_t newThread = 0;
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	const int result = pthread_create(&newThread, &attr, func, arg);
+	pthread_attr_destroy(&attr);
+	if (result != 0) {
+		fprintf(stderr, "Failed to start thread %s: %d\n", name ? name : "unknown", result);
+		return result;
+	}
 	if (thread) {
 		*thread = newThread;
 	}
+	return 0;
 }
 
 void InitMutex(MutexType* m) {
@@ -318,7 +334,7 @@ int ChangePath(strref path) {
 	if (stat(path_own.c_str(), &statbuf) != 0) {
 		return 1;
 	}
-	if (!(info.st_mode & S_IFDIR)) {
+	if (!(statbuf.st_mode & S_IFDIR)) {
 		return 1;
 	}
 	// Change the current working directory to the script's folder, and remove the path from the script file
@@ -417,6 +433,7 @@ uint8_t* LoadFile(const char* path, size_t* outSize) {
 int ValidateOrCreateOutputPath(strref file) {
 	// check if already encountered
 	file.trim_surrounding_quotes();
+	LockMutex(&ValidatePathMutex);
 	std::vector<BathPath>* currentPaths = &EncounteredOutputPaths;
 	strref splits = file;
 	bool found = true;	// if no path to the file then it is valid
@@ -439,7 +456,10 @@ int ValidateOrCreateOutputPath(strref file) {
 		if (!found) { break; }
 		splits += splitPath + 1;
 	}
-	if (found) { return 0; }
+	if (found) {
+		UnlockMutex(&ValidatePathMutex);
+		return 0;
+	 }
 
 // create the path if it does not exist
 // splitPath is the first folder that needs to be created, and recorded into currentPaths
@@ -453,8 +473,11 @@ int ValidateOrCreateOutputPath(strref file) {
 		currentPaths->push_back(newPath);
 		currentPaths = &currentPaths->back().subPaths;
 		splits += pathPart + 1;
-		return MakePathIfNotExists(folderToCreate);
+		int result = MakePathIfNotExists(folderToCreate);
+		UnlockMutex(&ValidatePathMutex);
+		return result;
 	}
+	UnlockMutex(&ValidatePathMutex);
 	return 0;
 }
 
@@ -576,8 +599,7 @@ int RunParallelCommand(strref commandline) {
 	AtomicIncrement(&NumberOfParallelCommands);
 	UnlockMutex(&ParallelCommandMutex);
 
-	StartThread(nullptr, 0, ParallelCommandThread, (void*)commandlinePtr, "ParallelCommand");
-	return 0;
+	return StartThread(nullptr, 0, ParallelCommandThread, (void*)commandlinePtr, "ParallelCommand");
 }
 
 strovl replaceFileMatch(strovl shared, strref match, strref replace) {
@@ -1084,6 +1106,7 @@ int main(int argc, char** argv) {
 		ChangePath(scriptPath);
 	}
 
+	InitMutex(&ValidatePathMutex);
 	InitMutex(&ParallelCommandMutex);
 	InitConditionVariable(&ParallelCommandWait);
 
@@ -1095,6 +1118,7 @@ int main(int argc, char** argv) {
 	// Shut down systems
 	DestroyConditionVariable(&ParallelCommandWait);
 	DestroyMutex(&ParallelCommandMutex);
+	DestroyMutex(&ValidatePathMutex);	
 
 	for (char* loadedFile : LoadedFiles) {
 		free(loadedFile);
