@@ -150,13 +150,12 @@ double GetMonotonicSeconds() {
 	return static_cast<double>(counter.QuadPart) / static_cast<double>(frequency.QuadPart);
 }
 
-void StartThread(ThreadType* thread, size_t stack, ThreadFunction func, void* arg, const char* name) {
+int StartThread(ThreadType* thread, size_t stack, ThreadFunction func, void* arg, const char* name) {
 	ThreadType newThread = CreateThread(NULL, stack, func, arg, 0, NULL);
 	if (thread) {
 		*thread = newThread;
-		return 0;
 	}
-	retirm 1;
+	return 0;
 }
 
 void InitMutex(MutexType* m) {
